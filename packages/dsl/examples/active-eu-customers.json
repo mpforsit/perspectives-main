@@ -1,0 +1,43 @@
+{
+  "id": "01J9X2KZQ5N7P3VCM8B4ETRGYH",
+  "name": "Active EU customers — last 30d",
+  "description": "Customers in EU countries with a recent order.",
+  "base": { "kind": "table", "schema": "public", "table": "customers" },
+  "columns": [
+    { "source": { "column": "id" }, "readonly": true, "width": 80 },
+    { "source": { "column": "full_name" } },
+    { "source": { "column": "email" } },
+    { "source": { "column": "country_code" }, "alias": "country" },
+    {
+      "source": { "computed": "EXTRACT(DAY FROM now() - last_login_at)::int" },
+      "alias": "days_since_login"
+    }
+  ],
+  "sort": [{ "column": "days_since_login", "direction": "asc" }],
+  "filters": {
+    "op": "and",
+    "children": [
+      {
+        "column": "country_code",
+        "op": "in",
+        "value": ["DE", "FR", "NL", "IT", "ES", "PL"]
+      },
+      {
+        "column": "last_order_at",
+        "op": "gte",
+        "value": { "kind": "today", "offset": -30 }
+      }
+    ]
+  },
+  "filterBar": {
+    "visible": [
+      { "column": "country_code", "label": "Country" },
+      { "column": "email", "label": "Email contains", "defaultOp": "ilike" }
+    ],
+    "collapsed": []
+  },
+  "defaultPageSize": 100,
+  "createdBy": "user_01J9X2KZQ5N7P3VCM8B4ETRGYH",
+  "updatedAt": "2026-05-27T09:00:00Z",
+  "version": 1
+}

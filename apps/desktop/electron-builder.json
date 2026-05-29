@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "dev.perspectives.desktop",
+  "productName": "Perspectives",
+  "copyright": "Copyright © 2026 Perspectives contributors",
+  "directories": {
+    "buildResources": "build",
+    "output": "release/${version}"
+  },
+  "files": [
+    "out/**/*",
+    "package.json",
+    "!**/{.eslintrc,.eslintignore,.prettierrc,tsconfig.json,*.map}"
+  ],
+  "asarUnpack": [],
+  "mac": {
+    "category": "public.app-category.developer-tools",
+    "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }]
+  },
+  "win": {
+    "target": [{ "target": "nsis", "arch": ["x64"] }]
+  },
+  "linux": {
+    "category": "Development",
+    "target": [{ "target": "AppImage", "arch": ["x64"] }]
+  }
+}
