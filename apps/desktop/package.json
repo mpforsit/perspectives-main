@@ -6,8 +6,9 @@
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "env -u ELECTRON_RUN_AS_NODE electron-vite dev",
-    "build": "electron-vite build && electron-builder",
-    "build:dir": "electron-vite build && electron-builder --dir",
+    "build": "electron-vite build",
+    "package": "electron-vite build && electron-builder",
+    "package:dir": "electron-vite build && electron-builder --dir",
     "preview": "env -u ELECTRON_RUN_AS_NODE electron-vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

@@ -1,8 +1,8 @@
 ## System primer (paste once at session start)
 
 You are helping build Perspectives, an open-source database client described in
-perspectives-plan.md in the project root. Read that file and dsl-schemas.ts
-before touching anything else.
+docs/plan.md. Read that file, docs/architecture.md, and
+packages/dsl/src/schemas.ts before touching anything else.
 
 Hard rules for this codebase:
 

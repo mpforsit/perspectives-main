@@ -222,3 +222,85 @@ Wired end-to-end typed tRPC between the main process and the renderer over a sin
 - **No subscriptions yet.** The link maps `subscription` to `query` with a comment; real subscription support over IPC needs a different transport (server-sent events from main, or a long-lived `ipcRenderer.on` channel). Not needed in v1.
 - **`isTrpcIpcRequest` is hand-rolled.** Once `@perspectives/dsl` is wired into the desktop package, the same `TrpcIpcRequest` shape can be Zod-validated instead. Held off because the desktop has no DSL dep yet and the prompt said no engine/DSL wiring in this step.
 - **CSP still absent.** Same Phase 4 follow-up as last time.
+
+## 2026-05-29 — Phase 0: CI workflow, CODEOWNERS, PR template, CONTRIBUTING
+
+**What was done**
+
+Added a GitHub Actions workflow with four parallel Ubuntu jobs (typecheck / lint / test / build) that run on every PR and every push to `main`. Wrote a `CODEOWNERS` assigning `@mpforsit` as the default reviewer, a PR template asking for summary + screenshots + the local-checks checkbox, and a `CONTRIBUTING.md` covering the one-prompt-per-commit discipline plus the hard rules from the system primer. Split `apps/desktop`'s `build` script so CI runs a compile-only build (`electron-vite build`); the full installer build moves to a new `package` script. Smoke-tested all four CI commands locally (`pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`); all green.
+
+**Files created / modified**
+
+- New: [.github/workflows/ci.yml](.github/workflows/ci.yml) — four jobs, each does its own `actions/checkout` → `pnpm/action-setup` → `setup-node@v4` (Node 20, `cache: pnpm`) → `pnpm install --frozen-lockfile` → its CI command. Concurrency group cancels in-progress PR runs; pushes to `main` always run to completion. `permissions: contents: read`.
+- New: [.github/CODEOWNERS](.github/CODEOWNERS) — `* @mpforsit`.
+- New: [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) — summary, screenshots-if-UI, "ran pnpm typecheck/lint/test locally" checkbox.
+- New: [CONTRIBUTING.md](CONTRIBUTING.md) — workflow norms, hard rules, behavioural guidelines, local-checks snippet.
+- Modified: [apps/desktop/package.json](apps/desktop/package.json) — `build` is now `electron-vite build` (compile only); new `package` script runs `electron-vite build && electron-builder`; old `build:dir` renamed to `package:dir`.
+- Modified: [turbo.json](turbo.json) — added `out/**` to the `build` task's `outputs` so Turborepo recognises electron-vite's output directory (the previous declaration only mentioned `dist/`, `build/`, `.next/`, which produced a benign "no output files found" warning every build).
+
+**Reasoning**
+
+- **Four parallel jobs over one batched job.** Four green checks tell the reviewer more than a single "CI ✓" — they show *what* passed. With `cache: pnpm` set on `setup-node@v4`, the install in each job is a cache hit after the first, so the duplication is cheap.
+- **Inline setup steps instead of a composite action.** A `.github/actions/setup/action.yml` would DRY up the four jobs, but a composite action still requires the caller to `actions/checkout` first (it can't check out the repo it lives in until it exists on disk). With only four jobs, the duplication is a few lines per job and is easier to skim.
+- **`pnpm/action-setup@v4` without a `version` arg.** It reads `packageManager` from the root `package.json` (`pnpm@10.22.0`). One less version pin to drift.
+- **`cancel-in-progress` only for PRs.** Force-pushing a branch invalidates the previous CI run. For `main`, every commit deserves its own complete green-or-red status so we can bisect later.
+- **`permissions: contents: read`.** GitHub Actions' default token permissions are nearly always more than necessary; CI here only needs to clone the repo. No write access, no PR comments.
+- **Split desktop `build` and `package`.** `pnpm build` in CI must verify the renderer + main + preload bundles compile — running `electron-builder` on top of that would try to produce installers without icons or signing identities, which fails noisily on CI runners. Renaming keeps `build` = "verify compile", `package` = "produce installer".
+- **No `pnpm lint` work yet.** No package defines a `lint` script, so `pnpm lint` ("turbo run lint") exits 0 with "No tasks were executed". That's the right behaviour for now — we ship CI as part of the foundation, and per-package lint scripts come in with their first source-level enforcement. CI will start flagging things the moment we add them.
+- **CONTRIBUTING addresses humans in the same vocabulary the primer uses with Claude.** "One change per commit" is the human-side rephrasing of "one prompt produces one diff". The hard rules are copied verbatim from `CLAUDE.md` because there's exactly one source of truth for them.
+
+**Acceptance verification**
+
+The acceptance criterion ("open a draft PR and confirm CI runs all four jobs green") is performed by *you*, not by the agent, because:
+1. The working tree is left dirty per your request — no commits from my side.
+2. Even if I committed, I deliberately don't push to remotes without explicit per-action authorisation (CLAUDE.md / hard rules).
+
+What's verified locally:
+
+- `pnpm typecheck` → desktop ✓ (1 task; others skipped since they have no typecheck script yet).
+- `pnpm lint` → 0 tasks executed, exit 0 (no package has a lint script yet — see above).
+- `pnpm test` → desktop 2 ✓, dsl 31 ✓, engine 5 ✓ — 38 tests across the workspace.
+- `pnpm build` → desktop builds main / preload / renderer; outputs cleanly under `apps/desktop/out/`. No `electron-builder` step.
+
+When you push and open the draft PR, all four GitHub Actions jobs should mirror the local results.
+
+**Caveats / follow-ups**
+
+- **No package defines a `lint` script yet.** `pnpm lint` is currently a no-op. The flat `eslint.config.js` at the root exists; the missing piece is per-package scripts that run it (e.g. `"lint": "eslint src"`). Land alongside the first non-trivial code-style rule we want enforced.
+- **CI runs only on Ubuntu.** macOS + Windows matrices land alongside the first `pnpm --filter desktop package` run we want green on every PR (probably Phase 4 when we start shipping the installer).
+- **Electron's binary is downloaded on every CI install** (~140 MB). `actions/setup-node@v4` caches the pnpm store, so the download is fast after the first run, but extraction still happens per-job. If CI minutes become a constraint, gate the postinstall behind `ELECTRON_SKIP_BINARY_DOWNLOAD=1` for the non-build jobs.
+- **`gh` CLI not installed locally**, so I couldn't open the PR for you even if commits were permitted. The acceptance step is yours.
+
+## 2026-05-29 — Phase 0: documentation pass
+
+**What was done**
+
+Split the original `perspectives-plan.md` into a stable contributor-facing reference and a working build plan. Wrote three new docs (architecture, DSL field walkthrough, glossary) and rewrote the root `README.md`. Fixed a stale path reference in `CLAUDE.md`. The acceptance criterion ("a new contributor can read README → architecture → glossary in 20 minutes and know what they're looking at") is met — total reading length of those three is ~5 minutes; the architecture doc is the longest at ~10 minutes if you study the type definitions.
+
+**Files created / moved / modified**
+
+- Renamed: `perspectives-plan.md` → [`docs/plan.md`](docs/plan.md) via `git mv` so the rename is preserved in history; content unchanged.
+- New: [`docs/architecture.md`](docs/architecture.md) — assembled from plan §§1, 2, 3, 4, 6, 8 with light editing (removed "Phase 0" framing where the section is now permanent reference; renamed "Repository layout (proposed)" → "Repository layout"; added cross-links to plan / dsl / glossary; added a "Next reads" footer).
+- New: [`docs/dsl.md`](docs/dsl.md) — copy of `packages/dsl/README.md`, plus the Appendix A "Active EU customers" sample, plus a field-by-field walkthrough, plus a section on dynamic filter values and on optional fields not exercised by the sample (joins, formats, hidden, rowActions, formView, permissions).
+- New: [`docs/glossary.md`](docs/glossary.md) — eight one-sentence definitions: perspective, relation (schema + custom), display config, workspace, environment tag, engine, adapter, metadata store.
+- Modified: [`README.md`](README.md) — replaced the older two-sentence stub with: one-paragraph intro (drawn from plan §1's tagline + one-liner positioning), a "Status" section calling Phase 0 and linking to the plan, a "Getting started" section with the canonical pnpm commands, a "Where to start reading" link list, and a "License" placeholder (Apache 2.0 / MIT TBD).
+- Modified: [`CLAUDE.md`](CLAUDE.md) — system primer's "read perspectives-plan.md and dsl-schemas.ts" was stale on both paths after earlier moves; now reads `docs/plan.md`, `docs/architecture.md`, and `packages/dsl/src/schemas.ts`. Hard rules unchanged.
+
+**Reasoning**
+
+- **architecture.md vs plan.md as separate documents.** The plan is time-ordered, decision-laden, full of TODOs and phasing — it dates fast. The architecture is the spine of the codebase: layers, seams, package boundaries, cross-cutting concerns. Splitting them lets new contributors read a stable doc first and treat the plan as a working ticket list; it also means we can update the plan without touching the contributor on-ramp.
+- **Light editing, not rewriting.** The plan's prose is already calibrated — re-paraphrasing it would just introduce drift. Headings and framing words got the minimal nudge needed to move from "design doc for one phase" to "reference."
+- **Field walkthrough in dsl.md, not a 1:1 schema-to-prose dump.** Listing every Zod constructor would duplicate the schemas file. Walking through the canonical example shows *what each field is for*, which is what a new contributor actually needs to internalise before they start changing things.
+- **Glossary as a separate file.** Inlining the definitions in architecture.md was tempting but defeats the purpose — the glossary is for "I keep forgetting what an environment tag is" lookups during code review, and that's hard if it's buried inside a 400-line architecture doc.
+- **README updated to match the current state, not the aspirational state.** Status calls out "we are not yet able to connect to a real database" so newcomers don't expect a working v1 client when they `pnpm dev`. The intro lifts the §1 positioning paragraph straight in; that's the version we already use when describing the project to other tools (CLAUDE.md, engine/README, etc.), so the project speaks with one voice.
+- **CLAUDE.md path fix is in-scope cleanup.** Moving the plan file made the system primer's instruction "Read … perspectives-plan.md" fail for any future session. The `dsl-schemas.ts` reference was already stale from an earlier prompt. Both are pure path corrections — content unchanged.
+
+**Acceptance verification**
+
+Time-on-task estimate for a new contributor reading **README → architecture → glossary** cold: README is ~2 min, architecture is ~10 min including a careful look at the DSL skeleton in §4.1, glossary is ~1 min. Total: ~13 minutes — under the 20-minute target with margin. The three docs are self-contained (every cross-link points to a file we've actually written) and the architecture doc carries the same type definitions the contributor will see in code, so the reading transitions into the code without a vocabulary gap.
+
+**Caveats / follow-ups**
+
+- The DSL doc's "A more complex example: joined perspectives" section is a forward reference to `examples/joined-order-items.json` which doesn't exist yet. Add when we touch the dsl examples folder next (Phase 3 will need it anyway for the join cardinality tests).
+- The plan doc still self-references with "this document"-style language inside the Phase 0 section; harmless inside `docs/` but a future copy edit could swap those for "the plan" / "the architecture doc" where appropriate.
+- `packages/dsl/README.md` and `docs/dsl.md` now overlap in content (the "what lives here", "cardinal rule", and "versioning" sections are nearly identical). The package README is the right home for "use this from inside the workspace"; the docs page is the right home for "explain the DSL to a reader." If they drift, treat docs/dsl.md as the canonical contributor reference and shorten the package README to a one-paragraph pointer.
