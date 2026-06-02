@@ -30,6 +30,22 @@ export const electronLink: TRPCLink<AppRouter> = () => {
     observable((observer) => {
       let cancelled = false;
 
+      const bridge = window.perspectivesAPI;
+      if (bridge === undefined) {
+        // We're loaded in a context without the Electron preload (e.g. a
+        // browser tab pointed at the renderer dev-server URL). There's no
+        // engine on the other end — surface a clear, actionable message
+        // instead of "Cannot read properties of undefined (reading 'trpc')".
+        observer.error(
+          TRPCClientError.from(
+            new Error(
+              "Engine bridge not available — Perspectives runs in the Electron shell, not a browser tab. Launch the app with `pnpm dev` and use the window it opens.",
+            ),
+          ),
+        );
+        return () => {};
+      }
+
       const request: TrpcIpcRequest = {
         type: op.type === "subscription" ? "query" : op.type,
         path: op.path,
@@ -39,7 +55,7 @@ export const electronLink: TRPCLink<AppRouter> = () => {
             : (superjson.serialize(op.input) as SuperJSONResult),
       };
 
-      window.perspectivesAPI
+      bridge
         .trpc(request)
         .then((response: TrpcIpcResponse) => {
           if (cancelled) return;

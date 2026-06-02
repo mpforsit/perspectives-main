@@ -14,11 +14,14 @@ The engine package is the **spine** of Perspectives — the layer between the UI
 
 ## The rule
 
-**This package has zero implementations.** No SQL is rendered here. No HTTP is opened here. No SQLite file is touched here. Anything that does work lives in a sibling package:
+**No SQL is rendered here. No HTTP is opened here. No SQLite file is touched here.** Concrete adapters and stores live in sibling packages:
 
 - `@perspectives/adapter-postgres` implements `DatabaseAdapter`. It is the only place in the whole repository that constructs SQL strings.
 - `@perspectives/metadata-sqlite` / `@perspectives/metadata-postgres` / `@perspectives/metadata-remote` implement `MetadataStore` against, respectively, a local SQLite file, a server-side Postgres database, and a remote HTTP API.
+- `InMemoryCredentialStore` (the test-grade `CredentialStore` implementation) lives in `@perspectives/metadata-sqlite`; the real `safeStorage`-backed one lives in `apps/desktop`.
 - Future dialects (MySQL, MSSQL, …) plug in by adding new adapter packages that satisfy the same interface.
+
+What *does* live here is [`EngineService`](src/service.ts) — orchestration: connection lifecycle, schema caching, plan compilation, error mapping. The service depends only on the engine's own interfaces and takes a `DatabaseAdapterFactory` so it never imports a concrete adapter package.
 
 If you find yourself reaching for `pg`, `better-sqlite3`, `fetch`, or any other runtime concern inside this package, **stop** — it belongs somewhere downstream.
 

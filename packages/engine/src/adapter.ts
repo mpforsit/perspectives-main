@@ -329,6 +329,15 @@ export interface DatabaseAdapter {
    *  one-off engine read. */
   runQuery(plan: QueryPlan): Promise<ResultSet>;
 
+  /**
+   * Execute raw user-authored SQL inside a `BEGIN TRANSACTION READ ONLY` /
+   * `ROLLBACK` envelope. This is the SQL-console path and the *only* place in
+   * the engine where unparsed SQL flows from a renderer caller to the DB.
+   * Read-only is enforced by the database, not by inspecting the SQL — any
+   * write attempt raises a `ValidationError` (mapped from SQLSTATE 25006).
+   */
+  runReadOnlySql(sql: string): Promise<ResultSet>;
+
   /** Execute a write. Returns the affected row count and (optionally) the
    *  RETURNING rows the plan requested. */
   runMutation(plan: MutationPlan): Promise<MutationResult>;
@@ -351,4 +360,16 @@ export interface DatabaseAdapter {
   /** Dialect-level capabilities. Synchronous — populated at adapter
    *  construction, then refined after the first successful `testConnection()`. */
   readonly dialect: DialectMetadata;
+
+  /** Release any held resources (connection pools, file handles, sockets).
+   *  Called by the engine when a connection is being deactivated or when a
+   *  one-shot probe (`EngineService.testConnection`) finishes. Idempotent. */
+  close(): Promise<void>;
 }
+
+/**
+ * Factory function that turns a `ConnectionProfile` into a live
+ * `DatabaseAdapter`. The engine never imports a concrete adapter package — it
+ * receives this factory from the composition layer at construction time.
+ */
+export type DatabaseAdapterFactory = (profile: import("./metadata").ConnectionProfile) => DatabaseAdapter;

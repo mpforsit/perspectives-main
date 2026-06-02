@@ -16,7 +16,7 @@ import {
   type TrpcIpcResponse,
 } from "../../shared/bridge";
 
-import { appRouter, createContext } from "./router";
+import { createContext, type AppRouter } from "./router";
 
 function isTrpcIpcRequest(value: unknown): value is TrpcIpcRequest {
   if (typeof value !== "object" || value === null) return false;
@@ -27,7 +27,7 @@ function isTrpcIpcRequest(value: unknown): value is TrpcIpcRequest {
   return true;
 }
 
-export function registerTrpcIpc(): void {
+export function registerTrpcIpc(router: AppRouter): void {
   ipcMain.handle(
     TRPC_IPC_CHANNEL,
     async (_event, raw: unknown): Promise<TrpcIpcResponse> => {
@@ -41,7 +41,7 @@ export function registerTrpcIpc(): void {
 
       try {
         const result = await callTRPCProcedure({
-          router: appRouter,
+          router,
           path: raw.path,
           getRawInput: async () =>
             raw.input === undefined ? undefined : superjson.deserialize(raw.input),

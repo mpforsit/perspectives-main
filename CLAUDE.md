@@ -92,3 +92,5 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
   - The reasoning behind the approach
   - Any caveats or follow-up tasks
 - At the start of each session, read AGENT_LOG.md to understand prior context.
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.

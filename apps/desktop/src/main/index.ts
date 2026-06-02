@@ -1,7 +1,13 @@
 import { join } from "node:path";
 import { app, BrowserWindow, shell } from "electron";
 
+import { PostgresAdapter } from "@perspectives/adapter-postgres";
+import { EngineService } from "@perspectives/engine";
+import { SqliteMetadataStore } from "@perspectives/metadata-sqlite";
+
+import { SafeStorageCredentialStore } from "./credentials";
 import { registerTrpcIpc } from "./trpc/ipc";
+import { makeAppRouter } from "./trpc/router";
 
 function createWindow(): void {
   const window = new BrowserWindow({
@@ -39,8 +45,47 @@ function createWindow(): void {
   }
 }
 
+/**
+ * Compose the engine layer. This is the *only* place in the repository that
+ * gets to know about every concrete implementation:
+ *   - `SqliteMetadataStore` (local on-disk persistence)
+ *   - `InMemoryCredentialStore` (placeholder until the Electron
+ *     `safeStorage`-backed implementation lands in a later prompt)
+ *   - `PostgresAdapter` via factory closure (per-connection-profile)
+ *
+ * Anything downstream — the tRPC router, the renderer — only sees
+ * `EngineService`.
+ */
+function composeEngine(): { engine: EngineService; close: () => Promise<void> } {
+  const userDataDir = app.getPath("userData");
+  const credentialStore = new SafeStorageCredentialStore();
+  const metadataStore = new SqliteMetadataStore({
+    filePath: join(userDataDir, "perspectives-metadata.sqlite"),
+    credentialStore,
+  });
+  const engine = new EngineService({
+    metadataStore,
+    credentialStore,
+    adapterFactory: (profile) => new PostgresAdapter(profile),
+  });
+  return {
+    engine,
+    close: async () => {
+      await engine.close();
+      await metadataStore.close();
+    },
+  };
+}
+
 app.whenReady().then(() => {
-  registerTrpcIpc();
+  const composition = composeEngine();
+  const appRouter = makeAppRouter(composition.engine);
+  registerTrpcIpc(appRouter);
+
+  app.on("before-quit", () => {
+    void composition.close();
+  });
+
   createWindow();
 
   app.on("activate", () => {

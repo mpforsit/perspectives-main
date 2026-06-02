@@ -8,7 +8,30 @@
       "Bash(pnpm --filter @perspectives/engine test)",
       "Bash(pnpm dev *)",
       "Bash(pnpm build *)",
-      "Bash(git mv *)"
+      "Bash(git mv *)",
+      "Bash(docker version *)",
+      "Bash(pnpm --filter @perspectives/adapter-postgres exec tsc --noEmit -p tsconfig.json)",
+      "Bash(pnpm --filter @perspectives/adapter-postgres test)",
+      "Bash(pnpm test *)",
+      "Bash(pnpm --filter @perspectives/engine exec tsc --noEmit -p tsconfig.json)",
+      "Bash(pnpm --filter @perspectives/metadata-sqlite exec tsc --noEmit -p tsconfig.json)",
+      "Bash(pnpm --filter @perspectives/metadata-sqlite test)",
+      "Bash(pnpm exec *)",
+      "Bash(pnpm --filter @perspectives/metadata-sqlite exec vitest run test/credentials.test.ts)",
+      "Bash(pnpm --filter @perspectives/desktop exec electron-vite build)",
+      "Bash(pnpm --filter @perspectives/desktop exec vitest run test/integration.test.ts --reporter=verbose)",
+      "Bash(pnpm --filter @perspectives/desktop rebuild electron)",
+      "Bash(pnpm rebuild *)",
+      "Bash(node node_modules/electron/install.js)",
+      "Bash(pnpm --filter @perspectives/desktop rebuild:electron)",
+      "Bash(pnpm --filter @perspectives/desktop rebuild:node)",
+      "Bash(pnpm --filter @perspectives/desktop typecheck)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/grid)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/session/useTablePage.test)",
+      "Bash(pnpm --filter @perspectives/desktop test)",
+      "Bash(pnpm --filter @perspectives/engine typecheck)",
+      "Bash(pnpm --filter @perspectives/adapter-postgres typecheck)",
+      "Bash(pnpm --filter @perspectives/desktop add @uiw/react-codemirror @codemirror/lang-sql @codemirror/state @codemirror/view @codemirror/commands)"
     ]
   }
 }

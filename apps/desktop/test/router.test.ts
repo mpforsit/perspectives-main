@@ -1,8 +1,33 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { inferRouterOutputs } from "@trpc/server";
 
-import { appRouter, createContext } from "../src/main/trpc/router";
-import type { AppRouter } from "../src/main/trpc/router";
+import {
+  EngineService,
+  type CredentialStore,
+  type DatabaseAdapter,
+  type DatabaseAdapterFactory,
+  type MetadataStore,
+} from "@perspectives/engine";
+
+import { createContext, makeAppRouter, type AppRouter } from "../src/main/trpc/router";
+
+// Health-only — the procedure doesn't touch the engine, but `makeAppRouter`
+// needs *some* `EngineService`. Stubs are cheap.
+const noopMetadataStore = {} as unknown as MetadataStore;
+const noopCredentialStore: CredentialStore = {
+  set: () => Promise.resolve(),
+  get: () => Promise.resolve(null),
+  delete: () => Promise.resolve(),
+};
+const noopAdapterFactory: DatabaseAdapterFactory = () => ({} as DatabaseAdapter);
+
+const engine = new EngineService({
+  metadataStore: noopMetadataStore,
+  credentialStore: noopCredentialStore,
+  adapterFactory: noopAdapterFactory,
+});
+
+const appRouter = makeAppRouter(engine);
 
 describe("AppRouter — health.ping", () => {
   it("compile-time output shape is { ok: true; version: string }", () => {

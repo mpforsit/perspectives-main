@@ -1,16 +1,23 @@
 /**
- * The Electron-main tRPC router.
+ * The Electron-main tRPC router factory.
  *
- * The router definition lives in the main process — it imports `@trpc/server`
- * and any future engine packages. The renderer reaches it only via a
- * type-only import (`import type { AppRouter }`) so none of the server-side
- * runtime gets bundled into the browser.
+ * Router *definitions* live here and in `./routers/*`. They depend only on
+ * the engine's `EngineService` interface — the composition layer passes a
+ * concrete instance in at startup. The renderer reaches the router only via
+ * a type-only import (`import type { AppRouter }`) so none of the
+ * server-side runtime gets bundled into the browser.
  */
 
 import { initTRPC } from "@trpc/server";
 import superjson from "superjson";
 
-import pkg from "../../../package.json";
+import type { EngineService } from "@perspectives/engine";
+
+import { makeConnectionsRouter } from "./routers/connections";
+import { makeDataRouter } from "./routers/data";
+import { makeHealthRouter } from "./routers/health";
+import { makeSchemaRouter } from "./routers/schema";
+import { makeSettingsRouter } from "./routers/settings";
 
 /** Empty for now. Workspace / user / request-id context lands here later. */
 export interface Context {
@@ -23,19 +30,21 @@ export function createContext(): Context {
 
 const t = initTRPC.context<Context>().create({ transformer: superjson });
 
-const healthRouter = t.router({
-  /**
-   * Liveness probe used by the renderer to confirm the engine is reachable.
-   * Returns the running build's version so the UI can show what's loaded.
-   */
-  ping: t.procedure.query((): { ok: true; version: string } => ({
-    ok: true,
-    version: pkg.version,
-  })),
-});
+/** The shared `t` builder, exposed for sub-router factories. */
+export type TrpcBuilder = typeof t;
 
-export const appRouter = t.router({
-  health: healthRouter,
-});
+/**
+ * Build the top-level tRPC router with a concrete `EngineService` wired in.
+ * Called once at startup by the main process (and by the integration test).
+ */
+export function makeAppRouter(engine: EngineService) {
+  return t.router({
+    health: makeHealthRouter(t),
+    connections: makeConnectionsRouter(t, engine),
+    schema: makeSchemaRouter(t, engine),
+    data: makeDataRouter(t, engine),
+    settings: makeSettingsRouter(t, engine),
+  });
+}
 
-export type AppRouter = typeof appRouter;
+export type AppRouter = ReturnType<typeof makeAppRouter>;

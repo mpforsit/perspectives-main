@@ -1,0 +1,39 @@
+# Local dev stack: a Postgres instance pre-seeded with the same fixture the
+# adapter-postgres test suite uses. Brings up on port 5433 so it can run
+# alongside a local default-port Postgres without conflict.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+#   host:     localhost
+#   port:     5433
+#   database: perspectives_dev
+#   user:     perspectives
+#   password: perspectives
+#
+# To re-seed (the init script only runs on a fresh volume):
+#
+#   docker compose -f docker-compose.dev.yml down -v
+#   docker compose -f docker-compose.dev.yml up -d
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: perspectives-postgres-dev
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: perspectives
+      POSTGRES_PASSWORD: perspectives
+      POSTGRES_DB: perspectives_dev
+    volumes:
+      - ./packages/adapter-postgres/test/fixtures/seed.sql:/docker-entrypoint-initdb.d/00-seed.sql:ro
+      - perspectives_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U perspectives -d perspectives_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  perspectives_dev_data:

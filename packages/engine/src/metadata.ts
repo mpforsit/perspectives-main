@@ -97,6 +97,31 @@ export interface KVStore {
   keys(prefix?: string): Promise<string[]>;
 }
 
+/**
+ * Where connection passwords live. **Never in `MetadataStore`** — that file is
+ * a flat JSON-ish database the user can hand off, copy between machines, or
+ * lose; passwords have a different lifecycle and a different threat model.
+ *
+ * Three concrete implementations are expected:
+ *   - `InMemoryCredentialStore` (lives in `@perspectives/metadata-sqlite`) —
+ *     ephemeral, for tests and the rare "I'll re-enter this every session"
+ *     mode.
+ *   - The Electron `safeStorage`-backed adapter (lives in `apps/desktop`) —
+ *     OS-keychain encrypted at rest. Lands in a later prompt.
+ *   - Server-side encrypted KV for shared connections (Phase 6).
+ *
+ * The interface is deliberately password-only for now; SSH passphrases, SSH
+ * private keys, and SSL client keys move through here when Phase 4 lands.
+ */
+export interface CredentialStore {
+  /** Persist the password for a connection. */
+  set(connectionId: string, password: string): Promise<void>;
+  /** Return the password, or `null` if no credential is stored for this id. */
+  get(connectionId: string): Promise<string | null>;
+  /** Idempotent — deleting a missing key is a no-op. */
+  delete(connectionId: string): Promise<void>;
+}
+
 // ============================================================================
 // ConnectionProfile — credentials and connection details.
 // ============================================================================
@@ -134,6 +159,16 @@ export interface ConnectionProfile {
   createdAt: string;
   updatedAt: string;
 }
+
+/**
+ * The same shape as `ConnectionProfile`, minus the password. This is what
+ * the engine's RPC surface returns from `listConnections`, `createConnection`,
+ * and `updateConnection` so a password never enters the renderer's React
+ * Query cache. The password only flows *in* (during create/update via the
+ * `ConnectionProfile` input shape) and is routed straight to the
+ * `CredentialStore`; it never flows back.
+ */
+export type ConnectionProfileSummary = Omit<ConnectionProfile, "password">;
 
 export interface SslOptions {
   mode: "disable" | "prefer" | "require" | "verify-ca" | "verify-full";

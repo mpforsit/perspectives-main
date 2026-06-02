@@ -2,5 +2,25 @@
   "name": "@perspectives/adapter-postgres",
   "version": "0.0.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@perspectives/engine": "workspace:*",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^10.13.2",
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.10",
+    "testcontainers": "^10.13.2",
+    "vitest": "^2.1.9"
+  }
 }

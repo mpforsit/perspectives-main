@@ -9,12 +9,14 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@perspectives/dsl": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "^20.14.0",
     "vitest": "^2.1.9"
   }
 }
