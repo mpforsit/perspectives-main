@@ -1,71 +1,37 @@
 /**
  * Zod schemas for tRPC procedure inputs.
  *
- * The engine's TypeScript interfaces (in `@perspectives/engine/metadata.ts`)
- * are the canonical shapes; these schemas are the runtime gate at the IPC
- * boundary. If they ever drift from the interfaces, the typecheck on the
- * router callers will catch it — `z.infer<typeof ...>` is structurally
- * assignable to / from the engine types.
+ * The "shared" persisted shapes (`ConnectionProfile`, `AuditEvent`, etc.)
+ * are re-exported from `@perspectives/dsl` — that package is the single
+ * source of truth, and using its schemas here means the IPC boundary, the
+ * SQLite store, and the engine all validate against the same definitions.
+ * See AUDIT-CODEX.md finding #9.
  *
- * Long-term, these schemas could move into `@perspectives/engine` (the same
- * "schema is source of truth" pattern the DSL package uses), but until there's
- * a second consumer the duplication is cheaper than the refactor.
+ * IPC-only shapes (`runReadOnlySqlInputSchema`, `getTablePageInputSchema`,
+ * etc.) stay in this file — they describe RPC arguments, not persisted
+ * objects.
  */
 
 import { z } from "zod";
 
+import {
+  connectionProfileSchema as canonicalConnectionProfileSchema,
+  dialectNameSchema,
+  environmentSchema as canonicalEnvironmentSchema,
+  sshTunnelOptionsSchema as canonicalSshTunnelOptionsSchema,
+  sslOptionsSchema as canonicalSslOptionsSchema,
+} from "@perspectives/dsl";
+
 // ============================================================================
-// Connection profile
+// Connection profile — re-exported from the canonical DSL schemas. The
+// trailing "Schema" suffix is preserved so call sites stay unchanged.
 // ============================================================================
 
-export const dialectSchema = z.enum([
-  "postgres",
-  "mysql",
-  "mssql",
-  "sqlite",
-  "other",
-]);
-
-export const environmentSchema = z.enum([
-  "production",
-  "staging",
-  "development",
-  "other",
-]);
-
-export const sslOptionsSchema = z.object({
-  mode: z.enum(["disable", "prefer", "require", "verify-ca", "verify-full"]),
-  caCert: z.string().optional(),
-  clientCert: z.string().optional(),
-  clientKey: z.string().optional(),
-});
-
-export const sshTunnelOptionsSchema = z.object({
-  host: z.string().min(1),
-  port: z.number().int().min(1).max(65_535),
-  user: z.string().min(1),
-  authMethod: z.enum(["password", "key"]),
-  password: z.string().optional(),
-  privateKey: z.string().optional(),
-  passphrase: z.string().optional(),
-});
-
-export const connectionProfileSchema = z.object({
-  id: z.string().min(1),
-  name: z.string().min(1),
-  dialect: dialectSchema,
-  host: z.string().min(1),
-  port: z.number().int().min(1).max(65_535),
-  database: z.string().min(1),
-  user: z.string().min(1),
-  password: z.string(),
-  applicationName: z.string().optional(),
-  environment: environmentSchema,
-  ssl: sslOptionsSchema.optional(),
-  sshTunnel: sshTunnelOptionsSchema.optional(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-});
+export const dialectSchema = dialectNameSchema;
+export const environmentSchema = canonicalEnvironmentSchema;
+export const sslOptionsSchema = canonicalSslOptionsSchema;
+export const sshTunnelOptionsSchema = canonicalSshTunnelOptionsSchema;
+export const connectionProfileSchema = canonicalConnectionProfileSchema;
 
 // ============================================================================
 // Sort + Cursor (for data.getTablePage)
@@ -113,4 +79,28 @@ export const runReadOnlySqlInputSchema = z.object({
   // 1 MiB upper bound — well past anything a human would paste into the
   // console; mostly a defence against accidental file-drop.
   sql: z.string().min(1).max(1_048_576),
+  /** Per-call override of the engine's SQL-console budget. The engine fills
+   *  defaults from `READ_ONLY_SQL_DEFAULTS` so the renderer may omit any
+   *  field. See AUDIT-CODEX.md finding #4. */
+  limits: z
+    .object({
+      statementTimeoutMs: z.number().int().positive().max(600_000).optional(),
+      idleInTransactionTimeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .max(600_000)
+        .optional(),
+      maxRows: z.number().int().nonnegative().max(1_000_000).optional(),
+      maxBytes: z.number().int().nonnegative().max(512 * 1024 * 1024).optional(),
+    })
+    .optional(),
+  /** Opaque token identifying an in-flight cancellation request. The router
+   *  registers an AbortController under this id so the renderer can call
+   *  `cancelReadOnlySql` and reach the running query through `pg_cancel_backend`. */
+  cancelToken: z.string().min(1).max(128).optional(),
+});
+
+export const cancelReadOnlySqlInputSchema = z.object({
+  cancelToken: z.string().min(1).max(128),
 });

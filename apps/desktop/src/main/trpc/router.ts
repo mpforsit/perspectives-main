@@ -20,6 +20,7 @@ import { makeSchemaRouter } from "./routers/schema";
 import { makeSettingsRouter } from "./routers/settings";
 
 /** Empty for now. Workspace / user / request-id context lands here later. */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export interface Context {
   // Intentionally empty.
 }

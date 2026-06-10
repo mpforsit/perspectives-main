@@ -29,3 +29,6 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+
+# Generated SBOMs (built by `pnpm sbom`)
+sbom.cdx.json

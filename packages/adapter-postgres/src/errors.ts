@@ -57,7 +57,17 @@ export function mapPgError(cause: unknown, fallbackMessage: string): EngineError
   if (code.startsWith("28")) {
     return new ConnectionError(message, { cause });
   }
-  // SQLSTATE class 57 — operator intervention (shutdown, admin disconnects).
+  // SQLSTATE 57014 — query_canceled. Surfaced when the caller's AbortSignal
+  // fires or `statement_timeout` trips. The renderer should distinguish "you
+  // hit cancel / it timed out" from "the database died", so we map it to a
+  // ValidationError with a normalized message.
+  if (code === "57014") {
+    return new ValidationError(
+      message.includes("statement timeout") ? message : `Query canceled: ${message}`,
+      { cause },
+    );
+  }
+  // Other SQLSTATE class 57 — operator intervention (admin shutdown, etc.).
   if (code.startsWith("57")) {
     return new ConnectionError(message, { cause });
   }

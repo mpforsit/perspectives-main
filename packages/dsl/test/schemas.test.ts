@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
   PerspectiveDef,
-  RelationDef,
   DisplayConfig,
   validatePerspective,
   validateRelation,
@@ -60,6 +59,7 @@ const validPerspective = {
   createdBy: "user_01J9X2KZQ5N7P3VCM8B4ETRGYH",
   updatedAt: "2026-05-27T09:00:00Z",
   version: 1,
+  trustedSql: true,
 };
 
 // ============================================================================
@@ -451,6 +451,78 @@ describe("ColumnSource — strictness", () => {
       ],
     });
     expect(result.ok).toBe(false);
+  });
+});
+
+// ============================================================================
+// Trusted-SQL boundary — see AUDIT-CODEX.md finding #5.
+// ============================================================================
+describe("PerspectiveDef — trustedSql boundary", () => {
+  it("rejects a `computed` column when trustedSql is absent (the safe default)", () => {
+    const result = validatePerspective({
+      ...validPerspective,
+      trustedSql: undefined,
+      columns: [
+        { source: { column: "id" } },
+        { source: { computed: "1+1" }, alias: "two" },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.issues[0]?.path).toEqual([
+        "columns",
+        1,
+        "source",
+        "computed",
+      ]);
+    }
+  });
+
+  it("rejects a `computed` column when trustedSql is explicitly false", () => {
+    const result = validatePerspective({
+      ...validPerspective,
+      trustedSql: false,
+      columns: [
+        { source: { column: "id" } },
+        { source: { computed: "1+1" }, alias: "two" },
+      ],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects a SQL-base perspective when trustedSql is false", () => {
+    const result = validatePerspective({
+      ...validPerspective,
+      trustedSql: false,
+      base: { kind: "sql", query: "SELECT 1 AS one" },
+      columns: [{ source: { column: "one" } }],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.issues[0]?.path).toEqual(["base", "kind"]);
+    }
+  });
+
+  it("accepts `computed` columns when trustedSql is true", () => {
+    const result = validatePerspective({
+      ...validPerspective,
+      trustedSql: true,
+      columns: [
+        { source: { column: "id" } },
+        { source: { computed: "1+1" }, alias: "two" },
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts a non-raw-SQL perspective whether trustedSql is set or not", () => {
+    const safe = {
+      ...validPerspective,
+      columns: [{ source: { column: "id" } }],
+    };
+    expect(validatePerspective({ ...safe, trustedSql: undefined }).ok).toBe(true);
+    expect(validatePerspective({ ...safe, trustedSql: false }).ok).toBe(true);
+    expect(validatePerspective({ ...safe, trustedSql: true }).ok).toBe(true);
   });
 });
 

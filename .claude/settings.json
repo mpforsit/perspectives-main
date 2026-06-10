@@ -31,7 +31,18 @@
       "Bash(pnpm --filter @perspectives/desktop test)",
       "Bash(pnpm --filter @perspectives/engine typecheck)",
       "Bash(pnpm --filter @perspectives/adapter-postgres typecheck)",
-      "Bash(pnpm --filter @perspectives/desktop add @uiw/react-codemirror @codemirror/lang-sql @codemirror/state @codemirror/view @codemirror/commands)"
+      "Bash(pnpm --filter @perspectives/desktop add @uiw/react-codemirror @codemirror/lang-sql @codemirror/state @codemirror/view @codemirror/commands)",
+      "Bash(pnpm audit *)",
+      "Bash(npm view *)",
+      "Bash(pnpm --filter @perspectives/metadata-sqlite exec pnpm rebuild better-sqlite3)",
+      "Bash(pnpm --filter @perspectives/desktop test -- url-policy)",
+      "Bash(pnpm --filter @perspectives/metadata-sqlite lint)",
+      "Bash(pnpm update *)",
+      "Bash(pnpm --filter @perspectives/desktop test -- sql-history)",
+      "Bash(pnpm --filter @perspectives/adapter-postgres test -- runtime)",
+      "Bash(pnpm --filter @perspectives/adapter-postgres test -- keyset-nulls)",
+      "Bash(pnpm --filter @perspectives/desktop test -- csp)",
+      "Bash(pnpm list *)"
     ]
   }
 }

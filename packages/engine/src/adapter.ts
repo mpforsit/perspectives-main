@@ -13,7 +13,18 @@
  * bootstrapping layer (Electron main, server entry, test harness).
  */
 
-import type { ColumnDef, FilterGroup, JoinDef, SortDef } from "@perspectives/dsl";
+import type {
+  ColumnDef,
+  DialectName,
+  FilterGroup,
+  JoinDef,
+  SortDef,
+} from "@perspectives/dsl";
+
+// Re-export so adapter consumers can pull a single import path. The DSL
+// remains the canonical home for `DialectName` (it's part of the
+// `ConnectionProfile` schema).
+export type { DialectName };
 
 // ============================================================================
 // Schema introspection
@@ -226,6 +237,38 @@ export interface ResultSet {
   rows: ResultRow[];
   /** True if the adapter cut the result short to respect a row cap. */
   truncated: boolean;
+  /** Why the result was cut short — populated when `truncated` is `true`.
+   *  Surface as a banner in the UI so the user knows the rows displayed are
+   *  not the full result. Adapters fill this whenever they truncate. */
+  truncationReason?: TruncationReason;
+}
+
+export type TruncationReason = "row-cap" | "byte-cap";
+
+/**
+ * Resource-limit and cancellation knobs for `runReadOnlySql`. Every field is
+ * optional; adapters pick safe defaults when omitted but the engine SHOULD
+ * always pass explicit values so the renderer's "this is the SQL console
+ * budget" is visible end-to-end.
+ */
+export interface ReadOnlySqlOpts {
+  /** Hard server-side time limit. Maps to PostgreSQL `statement_timeout`. */
+  statementTimeoutMs?: number;
+  /** Belt-and-suspenders cap on transactions that go idle (e.g. a query that
+   *  completed but the adapter couldn't drain in time). Maps to PostgreSQL
+   *  `idle_in_transaction_session_timeout`. */
+  idleInTransactionTimeoutMs?: number;
+  /** Maximum number of rows the adapter will buffer before stopping the
+   *  cursor and returning a truncated result. */
+  maxRows?: number;
+  /** Maximum total bytes (approximate, post-marshalling) the adapter will
+   *  buffer before truncating. Helps with wide rows where a low maxRows
+   *  still lets megabytes through. */
+  maxBytes?: number;
+  /** Caller-driven cancellation. Adapters wire this into the dialect's own
+   *  cancel mechanism (PostgreSQL `pg_cancel_backend`); the in-flight query
+   *  surfaces as a `ValidationError` with a "cancelled" message. */
+  signal?: AbortSignal;
 }
 
 export interface ResultColumn {
@@ -285,8 +328,6 @@ export interface ConnectionInfo {
   latencyMs: number;
 }
 
-export type DialectName = "postgres" | "mysql" | "mssql" | "sqlite" | "other";
-
 export interface DialectMetadata {
   name: DialectName;
   /** Negotiated server version. Populated after the first `testConnection()`. */
@@ -335,8 +376,12 @@ export interface DatabaseAdapter {
    * the engine where unparsed SQL flows from a renderer caller to the DB.
    * Read-only is enforced by the database, not by inspecting the SQL — any
    * write attempt raises a `ValidationError` (mapped from SQLSTATE 25006).
+   *
+   * Adapters MUST honor every field on `opts` so an unbounded `SELECT *
+   * FROM huge_table` can't tie up a pool client, exhaust memory, or page out
+   * the host. See AUDIT-CODEX.md finding #4.
    */
-  runReadOnlySql(sql: string): Promise<ResultSet>;
+  runReadOnlySql(sql: string, opts?: ReadOnlySqlOpts): Promise<ResultSet>;
 
   /** Execute a write. Returns the affected row count and (optionally) the
    *  RETURNING rows the plan requested. */

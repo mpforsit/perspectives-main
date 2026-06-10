@@ -1,13 +1,22 @@
 import { join } from "node:path";
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, session, shell } from "electron";
 
 import { PostgresAdapter } from "@perspectives/adapter-postgres";
 import { EngineService } from "@perspectives/engine";
 import { SqliteMetadataStore } from "@perspectives/metadata-sqlite";
 
 import { SafeStorageCredentialStore } from "./credentials";
+import { buildContentSecurityPolicy } from "./csp";
 import { registerTrpcIpc } from "./trpc/ipc";
 import { makeAppRouter } from "./trpc/router";
+import { isAllowedExternalUrl, resolveDevServerUrl } from "./url-policy";
+
+function currentDevServerUrl(): URL | null {
+  return resolveDevServerUrl({
+    isPackaged: app.isPackaged,
+    rendererUrl: process.env["ELECTRON_RENDERER_URL"],
+  });
+}
 
 function createWindow(): void {
   const window = new BrowserWindow({
@@ -29,17 +38,30 @@ function createWindow(): void {
 
   window.on("ready-to-show", () => window.show());
 
-  // Open external links in the user's default browser rather than a new window.
+  // Open external links in the user's default browser rather than a new
+  // window — and only when the URL is http(s).
   window.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
     return { action: "deny" };
   });
 
-  // In dev, electron-vite injects the renderer dev-server URL; in production
-  // we load the bundled index.html shipped under out/renderer/.
-  const devServerUrl = process.env["ELECTRON_RENDERER_URL"];
-  if (devServerUrl) {
-    void window.loadURL(devServerUrl);
+  // Top-level navigation away from the loaded renderer is never legitimate.
+  // The renderer is a SPA; intra-app routing happens via React state, not
+  // browser navigation. Deny everything by default.
+  window.webContents.on("will-navigate", (event, target) => {
+    const devUrl = currentDevServerUrl();
+    if (devUrl !== null && target.startsWith(devUrl.origin)) {
+      // Vite HMR triggers a will-navigate when it reloads the document — allow
+      // navigation back to the same loopback dev origin.
+      return;
+    }
+    event.preventDefault();
+    if (isAllowedExternalUrl(target)) void shell.openExternal(target);
+  });
+
+  const devUrl = currentDevServerUrl();
+  if (devUrl !== null) {
+    void window.loadURL(devUrl.toString());
   } else {
     void window.loadFile(join(__dirname, "../renderer/index.html"));
   }
@@ -77,7 +99,33 @@ function composeEngine(): { engine: EngineService; close: () => Promise<void> } 
   };
 }
 
+/**
+ * Install the Content-Security-Policy on every renderer response. Done as
+ * a response header (not a `<meta http-equiv>`) so the policy applies to
+ * `file://` loads in packaged builds too — meta-tag CSP is unreliable
+ * across Electron versions for non-HTTP origins.
+ */
+function installCsp(): void {
+  const devOrigin = currentDevServerUrl()?.origin;
+  const csp = buildContentSecurityPolicy({
+    isPackaged: app.isPackaged,
+    ...(devOrigin !== undefined ? { devOrigin } : {}),
+  });
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    const headers = { ...details.responseHeaders };
+    // Strip any upstream CSP — Vite's dev server doesn't set one, but be
+    // defensive against the next dependency that does. Case-insensitive
+    // delete.
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "content-security-policy") delete headers[key];
+    }
+    headers["Content-Security-Policy"] = [csp];
+    callback({ responseHeaders: headers });
+  });
+}
+
 app.whenReady().then(() => {
+  installCsp();
   const composition = composeEngine();
   const appRouter = makeAppRouter(composition.engine);
   registerTrpcIpc(appRouter);

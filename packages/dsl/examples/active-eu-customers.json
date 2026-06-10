@@ -39,5 +39,6 @@
   "defaultPageSize": 100,
   "createdBy": "user_01J9X2KZQ5N7P3VCM8B4ETRGYH",
   "updatedAt": "2026-05-27T09:00:00Z",
-  "version": 1
+  "version": 1,
+  "trustedSql": true
 }

@@ -1,4 +1,4 @@
-import { Pool, type FieldDef, type PoolConfig } from "pg";
+import { Pool, type FieldDef, type PoolConfig, type PoolClient } from "pg";
 
 import {
   ValidationError,
@@ -12,10 +12,12 @@ import {
   type MutationResult,
   type PageResult,
   type QueryPlan,
+  type ReadOnlySqlOpts,
   type ResultColumn,
   type ResultSet,
   type SchemaSnapshot,
   type SslOptions,
+  type TruncationReason,
 } from "@perspectives/engine";
 
 import { compileSelectQuery, type KeysetPredicate } from "./compiler";
@@ -129,12 +131,10 @@ export class PostgresAdapter {
   async runQuery(plan: QueryPlan): Promise<ResultSet> {
     const params: unknown[] = [];
     const sql = compileSelectQuery(plan, params);
-    let result;
-    try {
-      result = await this.pool.query(sql, params);
-    } catch (cause) {
-      throw mapPgError(cause, "Query failed");
-    }
+    const result = await this.withReadOnlyClient(
+      (client) => client.query(sql, params),
+      "Query failed",
+    );
     return {
       columns: mapResultColumns(result.fields),
       rows: result.rows as Record<string, unknown>[],
@@ -144,30 +144,93 @@ export class PostgresAdapter {
   }
 
   // --------------------------------------------------------------------------
+  // withReadOnlyClient — every read path on the adapter funnels through this
+  // helper so the target DB session is held to BEGIN TRANSACTION READ ONLY
+  // for the duration of the call. AUDIT-CODEX.md finding #5 + #4:
+  //
+  //   - Defense in depth against an accidental write reaching `runQuery`
+  //     or `paginateKeyset` (e.g. a hypothetical bug in the compiler).
+  //   - Symmetric session-GUC behaviour: anything `SET LOCAL` does inside
+  //     the txn rolls off on ROLLBACK.
+  //
+  // The cost is one extra BEGIN/ROLLBACK round trip per call. Acceptable
+  // for a desktop client; revisit if the engine ever batches reads.
+  // --------------------------------------------------------------------------
+  private async withReadOnlyClient<T>(
+    body: (client: PoolClient) => Promise<T>,
+    fallbackMessage: string,
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN TRANSACTION READ ONLY");
+      let result: T;
+      try {
+        result = await body(client);
+      } catch (cause) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          /* swallow — original error is what matters */
+        }
+        throw mapPgError(cause, fallbackMessage);
+      }
+      await client.query("ROLLBACK");
+      return result;
+    } finally {
+      client.release();
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // runReadOnlySql
   // --------------------------------------------------------------------------
 
   /**
    * Execute raw SQL inside a read-only transaction. Acquires a dedicated
-   * client so the BEGIN/ROLLBACK pair stays on the same session, runs the
-   * user's SQL, then unconditionally ROLLBACKs. Any write statement (INSERT,
-   * UPDATE, DELETE, DDL) raises SQLSTATE 25006 inside the transaction and we
-   * surface it through `mapPgError` as a `ValidationError`.
+   * client so the BEGIN/ROLLBACK pair stays on the same session, applies
+   * `statement_timeout` / `idle_in_transaction_session_timeout` so a runaway
+   * `pg_sleep(...)` or unbounded scan can't hold a pool slot indefinitely,
+   * wires the caller's `AbortSignal` to `pg_cancel_backend(pid)`, and
+   * truncates the materialized result to `maxRows` / `maxBytes`. ROLLBACK is
+   * unconditional — read-only doesn't need COMMIT and the symmetric
+   * ROLLBACK reverts any incidental session GUC changes the user's SQL made.
    *
-   * The rollback is wrapped in its own try/catch — once the session is in a
-   * failed state, ROLLBACK is required to release it back to the pool, but
-   * a second exception there would mask the original error.
+   * Write statements (INSERT, UPDATE, DELETE, DDL) raise SQLSTATE 25006 and
+   * surface via `mapPgError` as a `ValidationError`. Cancellation surfaces
+   * the same way (SQLSTATE 57014). See AUDIT-CODEX.md finding #4.
+   *
+   * **Memory note** (follow-up): rows are buffered in memory by pg before we
+   * see them, so the *real* protection against a 10M-row blow-out today is
+   * `statement_timeout`. True streaming with backpressure (via `pg-cursor`)
+   * is a follow-up; bounded `maxRows` × `statement_timeout` is good enough
+   * for the immediate threat model.
    */
-  async runReadOnlySql(sql: string): Promise<ResultSet> {
+  async runReadOnlySql(
+    sql: string,
+    opts: ReadOnlySqlOpts = {},
+  ): Promise<ResultSet> {
     const client = await this.pool.connect();
+    let cancelHook: (() => void) | undefined;
     try {
       await client.query("BEGIN TRANSACTION READ ONLY");
+
+      const statementTimeoutMs = sanitizeMs(opts.statementTimeoutMs);
+      if (statementTimeoutMs !== null) {
+        await client.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
+      }
+      const idleTimeoutMs = sanitizeMs(opts.idleInTransactionTimeoutMs);
+      if (idleTimeoutMs !== null) {
+        await client.query(
+          `SET LOCAL idle_in_transaction_session_timeout = ${idleTimeoutMs}`,
+        );
+      }
+
+      cancelHook = await this.installCancelHook(client, opts.signal);
+
       let result;
       try {
         result = await client.query(sql);
       } catch (cause) {
-        // Roll back the txn so the connection is reusable, then surface the
-        // mapped error to the caller.
         try {
           await client.query("ROLLBACK");
         } catch {
@@ -175,17 +238,59 @@ export class PostgresAdapter {
         }
         throw mapPgError(cause, "Read-only query failed");
       }
-      // Read-only by definition — no need to COMMIT; ROLLBACK is symmetric
-      // and protects against any accidental side effects from session GUCs.
+
       await client.query("ROLLBACK");
+
+      const allRows = (result.rows ?? []) as Record<string, unknown>[];
+      const { rows, truncationReason } = applyResultCaps(allRows, opts);
       return {
         columns: mapResultColumns(result.fields ?? []),
-        rows: (result.rows ?? []) as Record<string, unknown>[],
-        truncated: false,
+        rows,
+        truncated: truncationReason !== undefined,
+        ...(truncationReason !== undefined ? { truncationReason } : {}),
       };
     } finally {
+      cancelHook?.();
       client.release();
     }
+  }
+
+  /**
+   * Wire an `AbortSignal` to a backend-side `pg_cancel_backend(pid)` call.
+   * Returns a cleanup function the caller invokes once the query is done,
+   * whatever the outcome, so we don't leak the abort listener.
+   *
+   * `pg_cancel_backend` is the documented way to interrupt an in-flight
+   * server query without dropping the TCP connection — preferred over
+   * killing the socket because the server cleans up locks and temp work
+   * cleanly afterward.
+   */
+  private async installCancelHook(
+    client: PoolClient,
+    signal: AbortSignal | undefined,
+  ): Promise<(() => void) | undefined> {
+    if (signal === undefined) return undefined;
+    const pidResult = await client.query<{ pid: number }>(
+      "SELECT pg_backend_pid()::int AS pid",
+    );
+    const pid = pidResult.rows[0]?.pid;
+    if (pid === undefined) return undefined;
+
+    const onAbort = () => {
+      // Use the pool for the cancel call — we can't issue another query on
+      // the held client while it's busy with the user's statement.
+      void this.pool
+        .query("SELECT pg_cancel_backend($1::int)", [pid])
+        .catch(() => {
+          /* the user's query may have already finished; nothing to do */
+        });
+    };
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    return () => signal.removeEventListener("abort", onAbort);
   }
 
   // --------------------------------------------------------------------------
@@ -212,12 +317,10 @@ export class PostgresAdapter {
       ...(keysetPredicate !== undefined ? { keysetPredicate } : {}),
     });
 
-    let result;
-    try {
-      result = await this.pool.query(sql, params);
-    } catch (cause) {
-      throw mapPgError(cause, "Paginated query failed");
-    }
+    const result = await this.withReadOnlyClient(
+      (client) => client.query(sql, params),
+      "Paginated query failed",
+    );
 
     const rows = result.rows as Record<string, unknown>[];
     const hasMore = rows.length > pageSize;
@@ -264,12 +367,10 @@ export class PostgresAdapter {
     const inner = compileSelectQuery(countPlan, params);
     const sql = `SELECT COUNT(*)::text AS count FROM (${inner}) sub`;
 
-    let result;
-    try {
-      result = await this.pool.query<{ count: string }>(sql, params);
-    } catch (cause) {
-      throw mapPgError(cause, "countRows failed");
-    }
+    const result = await this.withReadOnlyClient(
+      (client) => client.query<{ count: string }>(sql, params),
+      "countRows failed",
+    );
     const first = result.rows[0];
     return first ? Number(first.count) : 0;
   }
@@ -289,21 +390,25 @@ export class PostgresAdapter {
       filters === undefined ||
       (filters.children.length === 0);
     if (filtersEmpty) {
-      try {
-        const result = await this.pool.query<{ reltuples: string | null }>(
-          `SELECT c.reltuples::text AS reltuples
-           FROM pg_class c
-           JOIN pg_namespace ns ON ns.oid = c.relnamespace
-           WHERE ns.nspname = $1 AND c.relname = $2`,
-          [plan.base.schema, plan.base.table],
-        );
-        const raw = result.rows[0]?.reltuples;
-        if (raw === null || raw === undefined) return 0;
-        const n = Number(raw);
-        return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
-      } catch (cause) {
-        throw mapPgError(cause, "estimateCount failed");
-      }
+      // Pull schema/table out before the closure so TypeScript keeps the
+      // `kind: "table"` narrowing — narrowing on `plan.base` doesn't reach
+      // inside the inner arrow.
+      const { schema, table } = plan.base;
+      const result = await this.withReadOnlyClient(
+        (client) =>
+          client.query<{ reltuples: string | null }>(
+            `SELECT c.reltuples::text AS reltuples
+             FROM pg_class c
+             JOIN pg_namespace ns ON ns.oid = c.relnamespace
+             WHERE ns.nspname = $1 AND c.relname = $2`,
+            [schema, table],
+          ),
+        "estimateCount failed",
+      );
+      const raw = result.rows[0]?.reltuples;
+      if (raw === null || raw === undefined) return 0;
+      const n = Number(raw);
+      return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
     }
 
     // Slow path: ask the planner. `EXPLAIN (FORMAT JSON)` returns one row
@@ -320,12 +425,10 @@ export class PostgresAdapter {
     const inner = compileSelectQuery(explainPlan, params);
     const sql = `EXPLAIN (FORMAT JSON) ${inner}`;
 
-    let result;
-    try {
-      result = await this.pool.query(sql, params);
-    } catch (cause) {
-      throw mapPgError(cause, "estimateCount failed");
-    }
+    const result = await this.withReadOnlyClient(
+      (client) => client.query(sql, params),
+      "estimateCount failed",
+    );
 
     const raw = result.rows[0]?.["QUERY PLAN"];
     const planArray = parseExplainJson(raw);
@@ -339,7 +442,6 @@ export class PostgresAdapter {
   // Not yet implemented (next prompts)
   // --------------------------------------------------------------------------
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   runMutation(_plan: MutationPlan): Promise<MutationResult> {
     return Promise.reject(
       new ValidationError("runMutation is not implemented yet"),
@@ -497,6 +599,90 @@ function mapResultColumns(fields: FieldDef[]): ResultColumn[] {
     jsType: pgOidToJsType(field.dataTypeID),
     nullable: true,
   }));
+}
+
+/**
+ * Sanitize a milliseconds option: reject negative / non-finite / fractional
+ * values, return `null` when the caller omitted the limit. Returning a
+ * cleaned integer here means the SQL we render via interpolation can never
+ * carry attacker-influenced characters even though `SET LOCAL <param> = N`
+ * does not accept parameter binding.
+ */
+function sanitizeMs(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  if (!Number.isFinite(value)) return null;
+  const i = Math.trunc(value);
+  if (i <= 0) return null;
+  return i;
+}
+
+/** Approximate per-row byte size for the byte-cap check. Strings dominate
+ *  size in normal usage; this is intentionally cheap rather than exact. */
+function estimateRowBytes(row: Record<string, unknown>): number {
+  let total = 0;
+  for (const value of Object.values(row)) {
+    if (typeof value === "string") {
+      total += value.length;
+    } else if (value === null || value === undefined) {
+      total += 4;
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      total += 8;
+    } else if (value instanceof Date) {
+      total += 24;
+    } else if (typeof value === "bigint") {
+      total += 16;
+    } else if (Buffer.isBuffer(value)) {
+      total += value.byteLength;
+    } else {
+      // Objects / arrays — fall back to JSON length.
+      try {
+        total += JSON.stringify(value).length;
+      } catch {
+        total += 64;
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Apply `maxRows` and `maxBytes` post-hoc to a fully-materialized result.
+ * The caps fire in order: rows first (cheap), then bytes. Returns a marker
+ * the caller surfaces back to the renderer so the UI can show a "results
+ * truncated" banner.
+ */
+function applyResultCaps(
+  allRows: Record<string, unknown>[],
+  opts: ReadOnlySqlOpts,
+): { rows: Record<string, unknown>[]; truncationReason: TruncationReason | undefined } {
+  let rows = allRows;
+  let truncationReason: TruncationReason | undefined;
+  if (
+    opts.maxRows !== undefined &&
+    opts.maxRows >= 0 &&
+    allRows.length > opts.maxRows
+  ) {
+    rows = allRows.slice(0, opts.maxRows);
+    truncationReason = "row-cap";
+  }
+  if (opts.maxBytes !== undefined && opts.maxBytes >= 0) {
+    let bytes = 0;
+    let cutAt: number | undefined;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row === undefined) continue;
+      bytes += estimateRowBytes(row);
+      if (bytes > opts.maxBytes && i > 0) {
+        cutAt = i;
+        break;
+      }
+    }
+    if (cutAt !== undefined) {
+      rows = rows.slice(0, cutAt);
+      truncationReason = "byte-cap";
+    }
+  }
+  return { rows, truncationReason };
 }
 
 interface ExplainPlanNode {

@@ -348,6 +348,21 @@ const PerspectiveDefV1 = z.object({
   createdBy: z.string().min(1),
   updatedAt: ISODateTime,
   version: z.literal(1),
+  /**
+   * Whether the perspective's author was a trusted writer. Set to `true`
+   * only by paths that have already verified the author's identity and
+   * intent — e.g. interactive desktop edits by the local user, or an
+   * authenticated workspace admin in shared mode. AI-generated perspectives
+   * and perspectives imported from untrusted sources MUST stay `false`
+   * (the default).
+   *
+   * Untrusted perspectives cannot carry `{ computed: <raw SQL> }` column
+   * sources or `base.kind: "sql"` queries — both are arbitrary-SQL escape
+   * hatches that would otherwise execute against the user's database with
+   * the connection's privileges. Compilation rejects them; see
+   * AUDIT-CODEX.md finding #5.
+   */
+  trustedSql: z.boolean().optional(),
 });
 
 /**
@@ -437,9 +452,49 @@ export function validatePerspective(
   input: unknown
 ): ValidationResult<PerspectiveDef> {
   const result = PerspectiveDef.safeParse(input);
-  return result.success
-    ? { ok: true, value: result.data }
-    : { ok: false, errors: result.error };
+  if (!result.success) {
+    return { ok: false, errors: result.error };
+  }
+  const trustError = enforceTrustedSqlBoundary(result.data);
+  if (trustError !== null) {
+    return { ok: false, errors: trustError };
+  }
+  return { ok: true, value: result.data };
+}
+
+/**
+ * Trust enforcement: untrusted perspectives must not carry raw-SQL escape
+ * hatches. `computed` column sources and `kind: "sql"` bases both feed
+ * arbitrary text into the compiled query; the only safe path for an
+ * untrusted (or AI-generated, or imported) perspective is to keep both
+ * shut. AUDIT-CODEX.md finding #5.
+ *
+ * Returns `null` when the perspective is acceptable, otherwise a
+ * `ZodError` aligned with `validatePerspective`'s error shape so callers
+ * don't branch on a second error type.
+ */
+function enforceTrustedSqlBoundary(p: PerspectiveDef): z.ZodError | null {
+  if (p.trustedSql === true) return null;
+  const issues: z.ZodIssue[] = [];
+  if (p.base.kind === "sql") {
+    issues.push({
+      code: "custom",
+      path: ["base", "kind"],
+      message:
+        "Untrusted perspectives cannot use a raw-SQL base. Set trustedSql=true on writers that have already verified the author's identity.",
+    });
+  }
+  for (const [i, col] of p.columns.entries()) {
+    if ("computed" in col.source) {
+      issues.push({
+        code: "custom",
+        path: ["columns", i, "source", "computed"],
+        message:
+          "Untrusted perspectives cannot use `computed` raw-SQL column sources. Set trustedSql=true on writers that have already verified the author's identity.",
+      });
+    }
+  }
+  return issues.length > 0 ? new z.ZodError(issues) : null;
 }
 
 export function validateRelation(

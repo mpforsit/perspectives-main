@@ -10,11 +10,10 @@ export default defineConfig({
     },
   },
   test: {
+    // Vitest 4 removed `environmentMatchGlobs`. Default to `node`; individual
+    // .tsx component tests opt into jsdom via the `// @vitest-environment
+    // jsdom` pragma at the top of the file.
     environment: "node",
-    environmentMatchGlobs: [
-      ["src/renderer/**/*.test.tsx", "jsdom"],
-      ["src/renderer/**/*.dom.test.ts", "jsdom"],
-    ],
     setupFiles: ["./test/setup-dom.ts"],
     globals: false,
   },

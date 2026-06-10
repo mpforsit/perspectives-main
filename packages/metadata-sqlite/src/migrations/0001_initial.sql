@@ -25,9 +25,12 @@ CREATE TABLE connections (
   "user"            TEXT NOT NULL,
   application_name  TEXT,
   environment       TEXT NOT NULL,
-  -- JSON-encoded SslOptions / SshTunnelOptions. Secret fields inside these
-  -- (clientKey, passphrase, sshTunnel.password, sshTunnel.privateKey) MUST
-  -- be left out by the writer; Phase 4 will move them into CredentialStore.
+  -- JSON-encoded SslOptions. Secret fields (ssl.clientKey, every
+  -- sshTunnel.* secret) are refused at the writer in `connections.ts`:
+  -- they would otherwise persist plaintext to this on-disk SQLite file.
+  -- Phase 4 routes them through `CredentialStore`; the columns can carry
+  -- their non-secret companions (caCert, clientCert, tunnel host/port/user)
+  -- once that lands.
   ssl_json          TEXT,
   ssh_tunnel_json   TEXT,
   created_at        TEXT NOT NULL,

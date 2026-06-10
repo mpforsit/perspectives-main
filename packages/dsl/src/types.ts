@@ -11,6 +11,16 @@
  */
 
 import type { z } from "zod";
+import {
+  auditActionSchema,
+  auditEventSchema,
+  connectionProfileSchema,
+  connectionProfileSummarySchema,
+  dialectNameSchema,
+  environmentSchema,
+  sshTunnelOptionsSchema,
+  sslOptionsSchema,
+} from "./metadata";
 import { schemas } from "./schemas";
 
 export type FilterGroup = z.infer<typeof schemas.FilterGroup>;
@@ -31,3 +41,15 @@ export type FilterBarConfig = Perspective["filterBar"];
 export type FilterBarField = FilterBarConfig["visible"][number];
 export type PerspectiveTableBase = Extract<PerspectiveBase, { kind: "table" }>;
 export type PerspectiveSqlBase = Extract<PerspectiveBase, { kind: "sql" }>;
+
+// Metadata-side types (canonical Zod-derived). AUDIT-CODEX.md finding #9.
+export type DialectName = z.infer<typeof dialectNameSchema>;
+export type EnvironmentTag = z.infer<typeof environmentSchema>;
+export type SslOptions = z.infer<typeof sslOptionsSchema>;
+export type SshTunnelOptions = z.infer<typeof sshTunnelOptionsSchema>;
+export type ConnectionProfile = z.infer<typeof connectionProfileSchema>;
+export type ConnectionProfileSummary = z.infer<
+  typeof connectionProfileSummarySchema
+>;
+export type AuditAction = z.infer<typeof auditActionSchema>;
+export type AuditEvent = z.infer<typeof auditEventSchema>;

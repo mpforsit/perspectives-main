@@ -16,13 +16,27 @@
  */
 
 import type {
+  AuditEvent,
+  ConnectionProfile,
+  ConnectionProfileSummary,
   DisplayConfig,
   PerspectiveDef,
   RelationDef,
+  SshTunnelOptions,
+  SslOptions,
 } from "@perspectives/dsl";
 
-import type { DialectName } from "./adapter";
-import type { AuditEvent } from "./audit";
+// Re-export the metadata-canonical types so existing
+// `@perspectives/engine` consumers keep working without churn. The DSL
+// remains the source of truth — these are the Zod-derived `z.infer<...>`
+// types, not parallel declarations. See AUDIT-CODEX.md finding #9.
+export type {
+  AuditEvent,
+  ConnectionProfile,
+  ConnectionProfileSummary,
+  SshTunnelOptions,
+  SslOptions,
+};
 
 // ============================================================================
 // Generic store interfaces.
@@ -123,75 +137,20 @@ export interface CredentialStore {
 }
 
 // ============================================================================
-// ConnectionProfile — credentials and connection details.
+// ConnectionProfile
+//
+// The shape is defined in `@perspectives/dsl` and re-exported above. The
+// invariant remains the same:
+//
+//   **Credentials are local-only.** Any field that could authenticate a
+//   session — `password`, `sshTunnel.password`, `sshTunnel.privateKey`,
+//   `sshTunnel.passphrase`, `ssl.clientKey` — MUST NOT appear in any
+//   payload sent over the network in any mode. The `MetadataStore` surface
+//   includes `connections: CRUDStore<ConnectionProfile>` for *local* stores
+//   only; the remote store implementation refuses to serialize this type.
+//   Phase 6 introduces server-side encrypted shared connections under a
+//   separate type — `ConnectionProfile` itself never leaves the device.
 // ============================================================================
-
-/**
- * A stored connection to a user's database.
- *
- * **Credentials are local-only.** A `ConnectionProfile` (any field on it that
- * could authenticate a session — `password`, `sshTunnel.password`,
- * `sshTunnel.privateKey`, `sshTunnel.passphrase`, `ssl.clientKey`) MUST NOT
- * appear in any payload sent over the network in any mode. The `MetadataStore`
- * surface includes `connections: CRUDStore<ConnectionProfile>` for *local*
- * stores; the remote store implementation refuses to serialize this type.
- * Phase 6 introduces server-side encrypted shared connections under a
- * separate type — `ConnectionProfile` itself never leaves the device.
- */
-export interface ConnectionProfile {
-  /** ULID. */
-  id: string;
-  /** User-facing label shown in the connection picker. */
-  name: string;
-  dialect: DialectName;
-  host: string;
-  port: number;
-  database: string;
-  user: string;
-  /** Local-only. Never leaves the user's device. */
-  password: string;
-  /** Sent as `application_name` to the server. Helps with `pg_stat_activity`. */
-  applicationName?: string;
-  /** Drives the prominent color band and write-confirmation step in the UI. */
-  environment: "production" | "staging" | "development" | "other";
-  ssl?: SslOptions;
-  sshTunnel?: SshTunnelOptions;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/**
- * The same shape as `ConnectionProfile`, minus the password. This is what
- * the engine's RPC surface returns from `listConnections`, `createConnection`,
- * and `updateConnection` so a password never enters the renderer's React
- * Query cache. The password only flows *in* (during create/update via the
- * `ConnectionProfile` input shape) and is routed straight to the
- * `CredentialStore`; it never flows back.
- */
-export type ConnectionProfileSummary = Omit<ConnectionProfile, "password">;
-
-export interface SslOptions {
-  mode: "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
-  /** PEM-encoded CA certificate. Local-only. */
-  caCert?: string;
-  /** PEM-encoded client certificate. Local-only. */
-  clientCert?: string;
-  /** PEM-encoded client private key. Local-only. */
-  clientKey?: string;
-}
-
-export interface SshTunnelOptions {
-  host: string;
-  port: number;
-  user: string;
-  authMethod: "password" | "key";
-  /** Local-only. */
-  password?: string;
-  /** PEM-encoded private key. Local-only. */
-  privateKey?: string;
-  /** Local-only. */
-  passphrase?: string;
-}
 
 // ============================================================================
 // Workspace / membership / share — shared-mode only.

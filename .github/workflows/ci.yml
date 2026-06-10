@@ -44,7 +44,22 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
+      # Guard against a regression where every package's `lint` script is
+      # removed (or never added) and turbo silently exits 0 with no work.
+      # See AUDIT-CODEX.md finding #8.
+      - name: Lint (fail on zero tasks)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          pnpm lint 2>&1 | tee "$tmp"
+          if grep -q "No tasks were executed as part of this run" "$tmp"; then
+            echo "::error::Turbo executed 0 lint tasks. Add a 'lint' script to every package that has source/tests." >&2
+            exit 1
+          fi
+          if grep -qE "Tasks:[[:space:]]+[0-9]+ successful, 0 total" "$tmp"; then
+            echo "::error::Turbo reported 0 total lint tasks." >&2
+            exit 1
+          fi
 
   test:
     name: Test
@@ -75,3 +90,46 @@ jobs:
       # `pnpm --filter desktop package` is the script that produces installers,
       # and we keep that out of CI until we add the macOS / Windows matrix.
       - run: pnpm build
+
+  audit:
+    name: Dependency audit (high+)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # See AUDIT-CODEX.md finding #2 + the immediate remediation roadmap.
+      # The gate runs at `--audit-level=high` so a new moderate doesn't
+      # break the build on its own; bump if/when we close the moderate
+      # backlog too.
+      - run: pnpm audit --audit-level=high
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    # Builds the SBOM on every push so the artifact is available alongside
+    # any release. See AUDIT-CODEX.md long-term #5: "SBOM generation and
+    # dependency provenance checks before public installers". The output
+    # is an artifact the release workflow can attach; this job doesn't
+    # fail the build on its own.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generate SBOM
+        run: pnpm sbom
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 90

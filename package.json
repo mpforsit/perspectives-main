@@ -2,6 +2,7 @@
   "name": "perspectives",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "description": "Open-source database client that turns rigid table-browsing into reusable, shareable, AI-steerable perspectives.",
   "packageManager": "pnpm@10.22.0",
   "engines": {
@@ -13,9 +14,11 @@
     "typecheck": "turbo run typecheck",
     "lint": "turbo run lint",
     "test": "turbo run test",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "sbom": "node tools/generate-sbom.mjs"
   },
   "devDependencies": {
+    "@cyclonedx/cdxgen": "^12.5.1",
     "@types/node": "^20.14.0",
     "eslint": "^9.16.0",
     "prettier": "^3.4.2",
@@ -28,6 +31,9 @@
       "better-sqlite3",
       "electron",
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "electron-builder-squirrel-windows": "^26.15.2"
+    }
   }
 }

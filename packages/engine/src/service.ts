@@ -29,6 +29,7 @@ import type {
   DatabaseAdapterFactory,
   PageResult,
   QueryPlan,
+  ReadOnlySqlOpts,
   ResultSet,
   SchemaSnapshot,
 } from "./adapter";
@@ -38,6 +39,7 @@ import type {
   CredentialStore,
   MetadataStore,
 } from "./metadata";
+import type { AuditEvent } from "./audit";
 import { NotFoundError, ValidationError } from "./errors";
 
 export interface EngineServiceOptions {
@@ -54,6 +56,25 @@ export interface GetTablePageArgs {
   cursor?: Cursor;
   pageSize?: number;
 }
+
+/**
+ * Defaults the engine applies to SQL-console reads when the renderer
+ * doesn't pass an explicit budget. Tuned for desktop interactive use:
+ *
+ *  - 30s statement timeout — long enough for real analytical queries on a
+ *    well-indexed table, short enough that the user notices a runaway plan.
+ *  - 35s idle-in-transaction timeout — small buffer over the statement
+ *    timeout to clean up if the client never picks up the result.
+ *  - 10k rows — the grid can render this comfortably; beyond is paging
+ *    territory anyway.
+ *  - 32 MiB total — caps the actual memory cost of a wide-row result.
+ */
+export const READ_ONLY_SQL_DEFAULTS = {
+  statementTimeoutMs: 30_000,
+  idleInTransactionTimeoutMs: 35_000,
+  maxRows: 10_000,
+  maxBytes: 32 * 1024 * 1024,
+} as const;
 
 export interface TableRef {
   connectionId: string;
@@ -243,10 +264,29 @@ export class EngineService {
    * console is the only caller — every other read path goes through a typed
    * `QueryPlan`. Read-only is enforced at the database level (see the
    * adapter's `runReadOnlySql`), not by inspecting the SQL.
+   *
+   * If the caller omits any of the resource-limit fields, the engine fills
+   * the SQL-console defaults (see `READ_ONLY_SQL_DEFAULTS`) so the renderer
+   * can't accidentally execute an unbounded query just by dropping a field
+   * from the input shape. See AUDIT-CODEX.md finding #4.
    */
-  async runReadOnlyQuery(connectionId: string, sql: string): Promise<ResultSet> {
+  async runReadOnlyQuery(
+    connectionId: string,
+    sql: string,
+    opts: ReadOnlySqlOpts = {},
+  ): Promise<ResultSet> {
     const adapter = this.requireAdapter(connectionId);
-    return adapter.runReadOnlySql(sql);
+    const effective: ReadOnlySqlOpts = {
+      statementTimeoutMs:
+        opts.statementTimeoutMs ?? READ_ONLY_SQL_DEFAULTS.statementTimeoutMs,
+      idleInTransactionTimeoutMs:
+        opts.idleInTransactionTimeoutMs ??
+        READ_ONLY_SQL_DEFAULTS.idleInTransactionTimeoutMs,
+      maxRows: opts.maxRows ?? READ_ONLY_SQL_DEFAULTS.maxRows,
+      maxBytes: opts.maxBytes ?? READ_ONLY_SQL_DEFAULTS.maxBytes,
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    };
+    return adapter.runReadOnlySql(sql, effective);
   }
 
   // --------------------------------------------------------------------------
@@ -261,6 +301,41 @@ export class EngineService {
 
   async setSetting<T>(key: string, value: T): Promise<void> {
     return this.metadataStore.settings.set<T>(key, value);
+  }
+
+  /** Delete a setting key. Idempotent — missing keys are a no-op. Used by
+   *  the SQL console's history controls so an opt-out wipes the underlying
+   *  row instead of leaving a stale empty payload. */
+  async deleteSetting(key: string): Promise<void> {
+    return this.metadataStore.settings.delete(key);
+  }
+
+  // --------------------------------------------------------------------------
+  // Audit log
+  //
+  // The single funnel for write-path audit events. Mutation routes (Phase 4)
+  // and permission-sensitive read paths (Phase 6) both call this — the
+  // canonical Zod schema is enforced inside the metadata store's
+  // `auditLog.append`, so a malformed event never reaches disk. See
+  // AUDIT-CODEX.md long-term #4 + docs/security.md.
+  //
+  // The mutation path will compose an event in the engine (where it has
+  // before/after row snapshots), call `recordAuditEvent`, then return to
+  // the caller. Audit failure does NOT roll the mutation back — the audit
+  // log is for forensics, not for transactional integrity — but it's
+  // surfaced as a `ValidationError` so the caller (and the test suite)
+  // notices.
+  // --------------------------------------------------------------------------
+
+  async recordAuditEvent(event: AuditEvent): Promise<void> {
+    return this.metadataStore.auditLog.append(event);
+  }
+
+  /** Read audit events. Phase 6 shared mode will scope these by workspace
+   *  in the middleware layer; today the engine just exposes the underlying
+   *  AppendStore semantics. */
+  async listAuditEvents(query?: { since?: string; until?: string; limit?: number; offset?: number }): Promise<AuditEvent[]> {
+    return this.metadataStore.auditLog.list(query);
   }
 
   // --------------------------------------------------------------------------

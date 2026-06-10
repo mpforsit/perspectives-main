@@ -254,6 +254,161 @@ describe("PostgresAdapter.runReadOnlySql", () => {
   });
 });
 
+describe("PostgresAdapter.paginateKeyset — nullable sort column", () => {
+  // Customers has a `tier` column that the seed leaves entirely null for
+  // every row. To exercise the null-aware predicate we promote a known
+  // subset to non-null tiers, then paginate by `tier` and confirm every
+  // row is visited exactly once. AUDIT-CODEX.md finding #10.
+
+  it("walks every customer exactly once when sorting by a nullable column", async () => {
+    // 600 rows get 'gold' / 'silver' / 'bronze'; the remaining 2400 stay
+    // NULL. The pagination must visit all 3000.
+    const setupSql = `
+      UPDATE customers SET tier = 'gold'   WHERE id <= 200;
+      UPDATE customers SET tier = 'silver' WHERE id BETWEEN 201 AND 400;
+      UPDATE customers SET tier = 'bronze' WHERE id BETWEEN 401 AND 600;
+      UPDATE customers SET tier = NULL     WHERE id > 600;
+    `;
+    // Direct query — we need write access to seed test data. The adapter's
+    // pool client is fine; the harness DB is mutable.
+    const adminClient = new PostgresAdapter(handle.profile);
+    try {
+      // Run inside a non-read-only path. `runMutation` isn't implemented yet
+      // so use the pg pool through `pool.query` via a small escape.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- testing utility
+      await (adminClient as any).pool.query(setupSql);
+    } finally {
+      await adminClient.close();
+    }
+
+    const plan = makePlan({
+      table: "customers",
+      columns: [
+        { source: { column: "id" } },
+        { source: { column: "tier" } },
+      ],
+      sort: [{ column: "tier", direction: "asc" }],
+    });
+
+    const { ids } = await paginateAll({ plan, pageSize: 250 });
+    expect(ids.length).toBe(3000);
+    // Every id appears exactly once.
+    expect(new Set(ids).size).toBe(3000);
+  }, 60_000);
+
+  it("walks every row when sorting DESC NULLS LAST on a nullable column", async () => {
+    const plan = makePlan({
+      table: "customers",
+      columns: [
+        { source: { column: "id" } },
+        { source: { column: "tier" } },
+      ],
+      sort: [{ column: "tier", direction: "desc", nulls: "last" }],
+    });
+    const { ids } = await paginateAll({ plan, pageSize: 350 });
+    expect(ids.length).toBe(3000);
+    expect(new Set(ids).size).toBe(3000);
+  }, 60_000);
+});
+
+describe("PostgresAdapter — read-only envelope on every read path", () => {
+  // Defense-in-depth check from AUDIT-CODEX.md finding #5: a structured
+  // QueryPlan can't write, but `withReadOnlyClient` is the safety net if
+  // the compiler ever regresses. We exercise that net by hand-rolling a
+  // raw write inside `runQuery`'s envelope via the same internal helper.
+  it("runQuery's helper rejects writes even when the SQL contains an INSERT", async () => {
+    // Reach into the private helper to feed it a write directly. If the
+    // BEGIN READ ONLY isn't in place, this would succeed and pollute the
+    // table — the read-only envelope must reject it.
+    const promise = (
+      adapter as unknown as {
+        withReadOnlyClient: (
+          body: (c: import("pg").PoolClient) => Promise<unknown>,
+          msg: string,
+        ) => Promise<unknown>;
+      }
+    ).withReadOnlyClient(
+      (client) =>
+        client.query("INSERT INTO customers (full_name) VALUES ('leak-test')"),
+      "rw probe",
+    );
+    await expect(promise).rejects.toThrowError(/read-only/i);
+
+    // Confirm the row didn't land.
+    const check = await adapter.runReadOnlySql(
+      "SELECT COUNT(*)::int AS c FROM customers WHERE full_name = 'leak-test'",
+    );
+    expect(Number(check.rows[0]?.["c"])).toBe(0);
+  });
+});
+
+describe("PostgresAdapter.runReadOnlySql — resource limits + cancellation", () => {
+  // Each test exercises one of the four "Short-term #1" guardrails from
+  // AUDIT-CODEX.md: server-side timeout, row cap, byte cap, AbortSignal.
+
+  it("aborts via statement_timeout when the user query runs too long", async () => {
+    await expect(
+      adapter.runReadOnlySql("SELECT pg_sleep(5)", { statementTimeoutMs: 150 }),
+    ).rejects.toThrowError(/(timeout|cancel)/i);
+  });
+
+  it("truncates with row-cap when more rows are produced than maxRows", async () => {
+    const result = await adapter.runReadOnlySql(
+      "SELECT id FROM customers ORDER BY id",
+      { maxRows: 7 },
+    );
+    expect(result.rows.length).toBe(7);
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("row-cap");
+  });
+
+  it("leaves a result alone when maxRows is not exceeded", async () => {
+    const result = await adapter.runReadOnlySql(
+      "SELECT id FROM customers ORDER BY id LIMIT 4",
+      { maxRows: 10 },
+    );
+    expect(result.rows.length).toBe(4);
+    expect(result.truncated).toBe(false);
+    expect(result.truncationReason).toBeUndefined();
+  });
+
+  it("truncates with byte-cap when row sizes blow past maxBytes", async () => {
+    // Each row is ~256 chars of text; with a 100-byte cap the first row
+    // alone won't trip it (we always include row 0) but the second will.
+    const result = await adapter.runReadOnlySql(
+      "SELECT repeat('a', 256) AS payload FROM generate_series(1, 50)",
+      { maxBytes: 100 },
+    );
+    expect(result.rows.length).toBeGreaterThan(0);
+    expect(result.rows.length).toBeLessThan(50);
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("byte-cap");
+  });
+
+  it("cancels an in-flight query when the AbortSignal fires", async () => {
+    const controller = new AbortController();
+    const queryPromise = adapter.runReadOnlySql("SELECT pg_sleep(5)", {
+      statementTimeoutMs: 10_000,
+      signal: controller.signal,
+    });
+    // Give the backend a moment to receive the query so the cancel can
+    // target an actually-running statement.
+    setTimeout(() => controller.abort(), 100);
+    await expect(queryPromise).rejects.toThrowError(/(cancel|abort)/i);
+  });
+
+  it("rejects immediately when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      adapter.runReadOnlySql("SELECT pg_sleep(5)", {
+        statementTimeoutMs: 10_000,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrowError(/(cancel|abort)/i);
+  });
+});
+
 describe("Cursor wire format", () => {
   it("round-trips through base64url-encoded JSON", () => {
     const original: Cursor = {

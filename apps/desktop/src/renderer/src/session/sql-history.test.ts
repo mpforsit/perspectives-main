@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   HISTORY_VERSION,
   loadHistory,
+  MAX_ENTRY_BYTES,
   MAX_HISTORY,
   pushHistory,
+  sqlHistoryEnabledKey,
   sqlHistoryKey,
   toHistoryPayload,
 } from "./sql-history";
@@ -12,6 +14,12 @@ import {
 describe("sqlHistoryKey", () => {
   it("namespaces by connection id and version", () => {
     expect(sqlHistoryKey("conn-x")).toBe(`session:conn-x:sqlHistory.v${HISTORY_VERSION}`);
+  });
+});
+
+describe("sqlHistoryEnabledKey", () => {
+  it("namespaces by connection id (no version — opt-out shouldn't reset)", () => {
+    expect(sqlHistoryEnabledKey("conn-x")).toBe("session:conn-x:sqlHistoryEnabled");
   });
 });
 
@@ -60,5 +68,17 @@ describe("pushHistory", () => {
     expect(out.length).toBe(MAX_HISTORY);
     expect(out[0]).toBe("new");
     expect(out[out.length - 1]).toBe(`q${MAX_HISTORY - 2}`);
+  });
+
+  it("is a no-op when history is disabled", () => {
+    expect(pushHistory(["a"], "b", { enabled: false })).toEqual(["a"]);
+    expect(pushHistory([], "b", { enabled: false })).toEqual([]);
+  });
+
+  it("drops entries larger than MAX_ENTRY_BYTES (UTF-8)", () => {
+    const tooBig = "x".repeat(MAX_ENTRY_BYTES + 1);
+    expect(pushHistory(["a"], tooBig)).toEqual(["a"]);
+    const justRight = "y".repeat(MAX_ENTRY_BYTES);
+    expect(pushHistory(["a"], justRight)).toEqual([justRight, "a"]);
   });
 });

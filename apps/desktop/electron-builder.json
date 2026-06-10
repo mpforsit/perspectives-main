@@ -7,6 +7,7 @@
     "buildResources": "build",
     "output": "release/${version}"
   },
+  "afterPack": "./build/flip-fuses.cjs",
   "files": [
     "out/**/*",
     "package.json",
@@ -15,13 +16,21 @@
   "asarUnpack": [],
   "mac": {
     "category": "public.app-category.developer-tools",
-    "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }]
+    "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }],
+    "hardenedRuntime": true,
+    "gatekeeperAssess": false,
+    "entitlements": "build/entitlements.mac.plist",
+    "entitlementsInherit": "build/entitlements.mac.plist",
+    "notarize": false
   },
+  "afterSign": "./build/notarize.cjs",
   "win": {
-    "target": [{ "target": "nsis", "arch": ["x64"] }]
+    "target": [{ "target": "nsis", "arch": ["x64"] }],
+    "signingHashAlgorithms": ["sha256"]
   },
   "linux": {
     "category": "Development",
     "target": [{ "target": "AppImage", "arch": ["x64"] }]
-  }
+  },
+  "publish": null
 }

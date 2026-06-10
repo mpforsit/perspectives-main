@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 
+import { auditEventSchema } from "@perspectives/dsl";
 import {
   ValidationError,
   type AppendListQuery,
@@ -10,6 +11,10 @@ import {
 /**
  * Append-only audit log. Writes are single-row inserts; reads support
  * since/until filters on the `timestamp` column plus a hard `limit`.
+ *
+ * Every event goes through the canonical Zod schema in `@perspectives/dsl`
+ * on write — bad shapes never reach the SQLite row. The schema is the
+ * single source of truth (see AUDIT-CODEX.md finding #9 + long-term #4).
  */
 
 interface AuditRow {
@@ -42,25 +47,27 @@ export class AuditLogStore implements AppendStore<AuditEvent> {
   }
 
   async append(event: AuditEvent): Promise<void> {
-    if (!event.id) throw new ValidationError("AuditEvent.id is required");
-    if (!event.userId) throw new ValidationError("AuditEvent.userId is required");
-    if (!event.timestamp) throw new ValidationError("AuditEvent.timestamp is required");
-    if (!event.connectionId) throw new ValidationError("AuditEvent.connectionId is required");
-    if (!event.table) throw new ValidationError("AuditEvent.table is required");
-    if (!event.action) throw new ValidationError("AuditEvent.action is required");
-
+    const parsed = auditEventSchema.safeParse(event);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const path = issue?.path?.join(".") ?? "AuditEvent";
+      throw new ValidationError(`${path}: ${issue?.message ?? "invalid"}`, {
+        cause: parsed.error,
+      });
+    }
+    const e = parsed.data;
     this.insertStmt.run(
-      event.id,
-      event.workspaceId ?? null,
-      event.userId,
-      event.timestamp,
-      event.connectionId,
-      event.perspectiveId ?? null,
-      event.table,
-      JSON.stringify(event.primaryKey ?? {}),
-      event.action,
-      event.beforeValues === undefined ? null : JSON.stringify(event.beforeValues),
-      event.afterValues === undefined ? null : JSON.stringify(event.afterValues),
+      e.id,
+      e.workspaceId ?? null,
+      e.userId,
+      e.timestamp,
+      e.connectionId,
+      e.perspectiveId ?? null,
+      e.table,
+      JSON.stringify(e.primaryKey),
+      e.action,
+      e.beforeValues === undefined ? null : JSON.stringify(e.beforeValues),
+      e.afterValues === undefined ? null : JSON.stringify(e.afterValues),
     );
     return Promise.resolve();
   }

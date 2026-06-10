@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+// @vitest-environment jsdom
+import { describe, expect, it, vi, type Mock } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { type ReactNode } from "react";
@@ -33,9 +34,9 @@ function makePage(
 }
 
 interface Harness {
-  fetchPage: ReturnType<typeof vi.fn>;
-  fetchEstimate: ReturnType<typeof vi.fn>;
-  fetchExactCount: ReturnType<typeof vi.fn>;
+  fetchPage: Mock<UseTablePageArgs["fetchPage"]>;
+  fetchEstimate: Mock<() => Promise<number>>;
+  fetchExactCount: Mock<() => Promise<number>>;
   wrapper: ({ children }: { children: ReactNode }) => JSX.Element;
 }
 

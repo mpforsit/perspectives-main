@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { ConnectionProfile } from "@perspectives/engine";
+import { ValidationError, type ConnectionProfile } from "@perspectives/engine";
 
 import { InMemoryCredentialStore, SqliteMetadataStore } from "../src";
 
@@ -83,6 +83,107 @@ describe("CredentialStore separation — password-leak guard", () => {
     // segregated it.
     expect(await credentialStore.get(profile.id)).toBe(password);
   });
+
+  /**
+   * Until Phase 4 ships a `CredentialStore`-routed secret path, every secret
+   * field on the connection profile must be refused at the writer. This is
+   * defense in depth on top of the IPC-boundary schema (see
+   * `apps/desktop/src/main/trpc/inputs.ts`) — a bug there would otherwise
+   * land plaintext secrets in the SQLite file.
+   */
+  it.each([
+    {
+      label: "ssl.clientKey",
+      overrides: {
+        ssl: {
+          mode: "verify-full" as const,
+          clientKey: "LEAK_GUARD_SENTINEL_CLIENT_KEY_PEM",
+        },
+      },
+    },
+    {
+      label: "sshTunnel.password",
+      overrides: {
+        sshTunnel: {
+          host: "bastion",
+          port: 22,
+          user: "deploy",
+          authMethod: "password" as const,
+          password: "LEAK_GUARD_SENTINEL_SSH_PASSWORD",
+        },
+      },
+    },
+    {
+      label: "sshTunnel.privateKey",
+      overrides: {
+        sshTunnel: {
+          host: "bastion",
+          port: 22,
+          user: "deploy",
+          authMethod: "key" as const,
+          privateKey: "LEAK_GUARD_SENTINEL_SSH_PRIVATE_KEY_PEM",
+        },
+      },
+    },
+    {
+      label: "sshTunnel.passphrase",
+      overrides: {
+        sshTunnel: {
+          host: "bastion",
+          port: 22,
+          user: "deploy",
+          authMethod: "key" as const,
+          passphrase: "LEAK_GUARD_SENTINEL_SSH_PASSPHRASE",
+        },
+      },
+    },
+  ])(
+    "refuses to persist a profile carrying $label",
+    async ({ overrides }) => {
+      const filePath = join(tmpDir, `secret-leak-${randomBytes(4).toString("hex")}.db`);
+      const credentialStore = new InMemoryCredentialStore();
+      const store = new SqliteMetadataStore({ filePath, credentialStore });
+
+      const profile: ConnectionProfile = {
+        id: `conn_${randomBytes(4).toString("hex")}`,
+        name: "Secret leak guard",
+        dialect: "postgres",
+        host: "localhost",
+        port: 5432,
+        database: "perspectives",
+        user: "perspectives",
+        password: "irrelevant",
+        environment: "development",
+        createdAt: "2026-06-03T00:00:00.000Z",
+        updatedAt: "2026-06-03T00:00:00.000Z",
+        ...overrides,
+      };
+
+      await expect(store.connections.create(profile)).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+
+      // Scan every file the store may have created for the sentinel — if the
+      // write was aborted *after* a partial flush, this is what catches it.
+      const files = readdirSync(tmpDir);
+      for (const name of files) {
+        const buf = readFileSync(join(tmpDir, name));
+        for (const sentinel of [
+          "LEAK_GUARD_SENTINEL_CLIENT_KEY_PEM",
+          "LEAK_GUARD_SENTINEL_SSH_PASSWORD",
+          "LEAK_GUARD_SENTINEL_SSH_PRIVATE_KEY_PEM",
+          "LEAK_GUARD_SENTINEL_SSH_PASSPHRASE",
+        ]) {
+          expect(
+            buf.includes(Buffer.from(sentinel, "utf8")),
+            `${sentinel} was found in ${name}`,
+          ).toBe(false);
+        }
+      }
+
+      await store.close();
+    },
+  );
 
   it("round-trips the password back onto a profile on read", async () => {
     const filePath = join(tmpDir, "round-trip.db");

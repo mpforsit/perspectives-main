@@ -12,14 +12,19 @@
  */
 
 import { TRPCClientError, type TRPCLink } from "@trpc/client";
-import { createTRPCReact } from "@trpc/react-query";
+import { createTRPCReact, type CreateTRPCReact } from "@trpc/react-query";
 import { observable } from "@trpc/server/observable";
 import superjson, { type SuperJSONResult } from "superjson";
 
 import type { AppRouter } from "../../../main/trpc/router";
 import type { TrpcIpcRequest, TrpcIpcResponse } from "../../../shared/bridge";
 
-export const trpc = createTRPCReact<AppRouter>();
+// TypeScript 5.9 enforces portable type inference more aggressively;
+// without this annotation the inferred type references an internal tRPC
+// declaration whose source path is bundle-mangled (".d-CruH3ncI.d.mts").
+// `CreateTRPCReact` is the public alias for the same shape.
+export const trpc: CreateTRPCReact<AppRouter, unknown> =
+  createTRPCReact<AppRouter>();
 
 function isSuperJSONResult(value: unknown): value is SuperJSONResult {
   return typeof value === "object" && value !== null && "json" in value;

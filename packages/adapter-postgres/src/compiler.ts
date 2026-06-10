@@ -280,16 +280,24 @@ function compileDynamicValue(value: DynamicValue): string {
 // ============================================================================
 // Keyset predicate
 //
-// Compile `(c1, c2, ..., cN) > (v1, v2, ..., vN)` as a nested-OR expansion so
-// that per-column ASC/DESC directions can differ:
+// Move past the tuple `(v1, ..., vN)` in the effective sort order. The
+// classical formulation is the nested-OR expansion:
 //
 //   (c1 [>|<] v1)
 //   OR (c1 = v1 AND c2 [>|<] v2)
 //   OR (c1 = v1 AND c2 = v2 AND c3 [>|<] v3)
 //   ...
 //
-// Row-tuple comparison `(c1, c2) > (v1, v2)` would be tighter SQL but only
-// works when every column shares a direction.
+// Per-column ASC/DESC directions can differ here; row-tuple comparison
+// `(c1, c2) > (v1, v2)` would be tighter but only works when every column
+// shares a direction.
+//
+// Nullable columns get null-aware variants because `NULL > x` is `NULL`
+// (unknown), which silently drops rows. AUDIT-CODEX.md finding #10. The
+// equality and "strict greater" predicates branch on whether the cursor
+// value and/or the row value can be null, and respect each column's
+// effective NULLS FIRST / NULLS LAST treatment (defaulting to the
+// PostgreSQL standard: ASC = NULLS LAST, DESC = NULLS FIRST).
 // ============================================================================
 
 function compileKeysetPredicate(
@@ -303,19 +311,84 @@ function compileKeysetPredicate(
   }
   const branches: string[] = [];
   for (let i = 0; i < predicate.sort.length; i++) {
+    const sortI = predicate.sort[i];
+    if (sortI === undefined) continue;
+    const valueI = predicate.values[i];
+    const strict = compileKeysetStrict(sortI, valueI, params);
+    if (strict === null) continue;
+
     const parts: string[] = [];
     for (let j = 0; j < i; j++) {
       const sortJ = predicate.sort[j];
       if (sortJ === undefined) continue;
-      params.push(predicate.values[j]);
-      parts.push(`${quoteIdentifier(sortJ.column)} = $${params.length}`);
+      parts.push(compileKeysetEquality(sortJ, predicate.values[j], params));
     }
-    const sortI = predicate.sort[i];
-    if (sortI === undefined) continue;
-    const op = sortI.direction === "asc" ? ">" : "<";
-    params.push(predicate.values[i]);
-    parts.push(`${quoteIdentifier(sortI.column)} ${op} $${params.length}`);
+    parts.push(strict);
     branches.push(`(${parts.join(" AND ")})`);
   }
+  // No movable column at all (every column's cursor value sat at the
+  // ordering's terminal NULL slot). Returning FALSE rather than an empty
+  // string keeps the surrounding WHERE valid.
+  if (branches.length === 0) return "FALSE";
   return `(${branches.join(" OR ")})`;
+}
+
+/**
+ * `column = value` semantics aligned with the cursor: a NULL cursor value
+ * must compare equal to a NULL row value (SQL `=` is `NULL` in that case),
+ * so we substitute `IS NOT DISTINCT FROM` semantics by hand.
+ */
+function compileKeysetEquality(
+  sort: SortDef,
+  value: unknown,
+  params: unknown[],
+): string {
+  const col = quoteIdentifier(sort.column);
+  if (value === null) {
+    return `${col} IS NULL`;
+  }
+  params.push(value);
+  return `${col} = $${params.length}`;
+}
+
+/**
+ * Strict "past `value`" predicate for one column under its effective sort
+ * direction + nulls placement. Returns `null` when `value` already sits at
+ * the ordering's terminal slot — that column can no longer advance the
+ * iteration on its own, so the branch is dropped.
+ */
+function compileKeysetStrict(
+  sort: SortDef,
+  value: unknown,
+  params: unknown[],
+): string | null {
+  const col = quoteIdentifier(sort.column);
+  const ascending = sort.direction === "asc";
+  const nullsLast = effectiveNullsLast(sort);
+
+  if (value === null) {
+    // Cursor sits at a NULL value. Whether the iteration can move further
+    // on this column depends on where NULLs are placed in the order:
+    //   NULLS FIRST → NULL is at the start, everything non-NULL is past it
+    //   NULLS LAST  → NULL is at the end, nothing is past it
+    return nullsLast ? null : `${col} IS NOT NULL`;
+  }
+
+  const op = ascending ? ">" : "<";
+  params.push(value);
+  const strict = `${col} ${op} $${params.length}`;
+
+  // For NULLS LAST under either direction, NULL rows sit *after* every
+  // non-null value, so they are "past" the cursor's non-null value too —
+  // include them via OR. For NULLS FIRST, NULLs come *before* the cursor's
+  // value, so they are already covered by an earlier iteration step and
+  // must be excluded (`col > $n` already does so — SQL filters them out).
+  return nullsLast ? `(${strict} OR ${col} IS NULL)` : strict;
+}
+
+function effectiveNullsLast(sort: SortDef): boolean {
+  if (sort.nulls === "last") return true;
+  if (sort.nulls === "first") return false;
+  // PostgreSQL defaults: ASC → NULLS LAST, DESC → NULLS FIRST.
+  return sort.direction === "asc";
 }

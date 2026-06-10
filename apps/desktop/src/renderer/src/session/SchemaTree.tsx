@@ -48,7 +48,6 @@ export function SchemaTree({ snapshot, forceExpanded, onOpen }: SchemaTreeProps)
     return e;
     // We intentionally don't recompute on every snapshot — the user's
     // expand/collapse should persist across re-renders within a session.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const [expanded, setExpanded] = useState<Set<string>>(defaultExpanded);

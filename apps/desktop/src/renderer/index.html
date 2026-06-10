@@ -4,25 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Perspectives</title>
-    <script>
-      // FOUC prevention: apply the saved theme class before the first paint.
-      (function () {
-        try {
-          var stored = localStorage.getItem("perspectives:theme");
-          var theme =
-            stored === "dark" || stored === "light"
-              ? stored
-              : window.matchMedia("(prefers-color-scheme: dark)").matches
-                ? "dark"
-                : "light";
-          if (theme === "dark") {
-            document.documentElement.classList.add("dark");
-          }
-        } catch (_e) {
-          /* localStorage unavailable — fall back to light. */
-        }
-      })();
-    </script>
+    <!-- Pre-paint theme init (replaces the previous inline script so a strict
+         Content-Security-Policy with no 'unsafe-inline' can ship). Loaded
+         synchronously so it executes before the React entry below. -->
+    <script type="module" src="/src/theme-init.ts"></script>
   </head>
   <body class="h-full">
     <div id="root" class="h-full"></div>
