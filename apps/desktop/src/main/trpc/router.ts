@@ -15,7 +15,9 @@ import type { EngineService } from "@perspectives/engine";
 
 import { makeConnectionsRouter } from "./routers/connections";
 import { makeDataRouter } from "./routers/data";
+import { makeDisplayConfigRouter } from "./routers/displayConfig";
 import { makeHealthRouter } from "./routers/health";
+import { makeRelationsRouter } from "./routers/relations";
 import { makeSchemaRouter } from "./routers/schema";
 import { makeSettingsRouter } from "./routers/settings";
 
@@ -44,6 +46,8 @@ export function makeAppRouter(engine: EngineService) {
     connections: makeConnectionsRouter(t, engine),
     schema: makeSchemaRouter(t, engine),
     data: makeDataRouter(t, engine),
+    relations: makeRelationsRouter(t, engine),
+    displayConfig: makeDisplayConfigRouter(t, engine),
     settings: makeSettingsRouter(t, engine),
   });
 }

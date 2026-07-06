@@ -4,6 +4,9 @@ import {
   ValidationError,
   type ConnectionInfo,
   type ConnectionProfile,
+  type CountByGroupArgs,
+  type CountByGroupResult,
+  type CountByGroupValue,
   type Cursor,
   type DialectMetadata,
   type FilterOpCapability,
@@ -20,7 +23,7 @@ import {
   type TruncationReason,
 } from "@perspectives/engine";
 
-import { compileSelectQuery, type KeysetPredicate } from "./compiler";
+import { compileSelectQuery, quoteIdentifier, type KeysetPredicate } from "./compiler";
 import { mapPgError } from "./errors";
 import { introspect } from "./introspect";
 import {
@@ -436,6 +439,63 @@ export class PostgresAdapter {
     return typeof planRows === "number"
       ? Math.max(0, Math.round(planRows))
       : 0;
+  }
+
+  // --------------------------------------------------------------------------
+  // countByGroup
+  // --------------------------------------------------------------------------
+
+  async countByGroup(
+    args: CountByGroupArgs,
+  ): Promise<CountByGroupResult[]> {
+    if (args.inTuples.length === 0) return [];
+    if (args.groupColumns.length === 0) {
+      throw new ValidationError("countByGroup: groupColumns must be non-empty");
+    }
+    for (const t of args.inTuples) {
+      if (t.length !== args.groupColumns.length) {
+        throw new ValidationError(
+          `countByGroup: tuple length ${t.length} doesn't match groupColumns length ${args.groupColumns.length}`,
+        );
+      }
+    }
+
+    const quotedCols = args.groupColumns.map(quoteIdentifier);
+    const colList = quotedCols.join(", ");
+
+    const params: unknown[] = [];
+    const tupleSql: string[] = [];
+    for (const tuple of args.inTuples) {
+      const placeholders: string[] = [];
+      for (const v of tuple) {
+        params.push(v);
+        placeholders.push(`$${params.length}`);
+      }
+      tupleSql.push(`(${placeholders.join(", ")})`);
+    }
+    // Single-column form: `WHERE (col) IN ((v1), (v2), ...)`. Postgres treats
+    // `(col)` and `(v)` as grouping rather than 1-tuples, which reduces to
+    // `col IN (v1, v2, ...)` — semantically identical, no special-case needed.
+    const whereExpr = `(${colList}) IN (${tupleSql.join(", ")})`;
+
+    const sql = `SELECT ${colList}, COUNT(*)::text AS __count
+                 FROM ${quoteIdentifier(args.schema)}.${quoteIdentifier(args.table)}
+                 WHERE ${whereExpr}
+                 GROUP BY ${colList}`;
+
+    const result = await this.withReadOnlyClient(
+      (client) => client.query(sql, params),
+      "countByGroup failed",
+    );
+
+    return result.rows.map((row: Record<string, unknown>) => {
+      const key = args.groupColumns.map(
+        (c) => (row[c] ?? null) as CountByGroupValue,
+      );
+      const raw = row["__count"];
+      const n = typeof raw === "string" ? Number(raw) : Number(raw);
+      return { key, count: Number.isFinite(n) ? n : 0 };
+    });
   }
 
   // --------------------------------------------------------------------------

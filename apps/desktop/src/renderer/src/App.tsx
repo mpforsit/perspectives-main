@@ -74,12 +74,15 @@ export function App() {
 
   return (
     <div className="relative flex min-h-screen flex-col bg-background">
+      {active === null && (
+        <div className="absolute inset-x-0 top-0 h-6 [-webkit-app-region:drag]" />
+      )}
       <Button
         variant="ghost"
         size="icon"
         onClick={toggleTheme}
         aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        className="absolute right-4 top-4 z-20"
+        className="absolute right-4 top-4 z-20 [-webkit-app-region:no-drag]"
       >
         {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
       </Button>

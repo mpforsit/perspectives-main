@@ -11,7 +11,20 @@
 
 import { z } from "zod";
 
+import { schemas as dslSchemas } from "@perspectives/dsl";
+
 import type { OpenTab } from "./types";
+
+/** DSL-canonical FilterGroup. Reused for the filteredTable variant's
+ *  `filter` and breadcrumb step filters. */
+const filterGroupSchema = dslSchemas.FilterGroup;
+
+const breadcrumbStepSchema = z.object({
+  schema: z.string().min(1).max(255),
+  table: z.string().min(1).max(255),
+  label: z.string().min(1).max(255),
+  filter: filterGroupSchema,
+});
 
 export interface PersistedTabs {
   tabs: OpenTab[];
@@ -36,10 +49,23 @@ const sqlTabSchema = z.object({
   title: z.string().min(1).max(120),
 });
 
+const filteredTableTabSchema = z.object({
+  kind: z.literal("filteredTable"),
+  id: z.string().min(1).max(64),
+  schema: z.string().min(1).max(255),
+  name: z.string().min(1).max(255),
+  filter: filterGroupSchema,
+  // 1..16 hops — the same ceiling as the FK navigation depth a user can
+  // realistically follow before the trail becomes useless. The renderer's
+  // overflow UI (Phase 2.7) keeps long trails readable.
+  crumbs: z.array(breadcrumbStepSchema).min(1).max(16),
+});
+
 const openTabSchema = z.discriminatedUnion("kind", [
   tableTabSchema,
   viewTabSchema,
   sqlTabSchema,
+  filteredTableTabSchema,
 ]);
 
 const persistedSchema = z.object({

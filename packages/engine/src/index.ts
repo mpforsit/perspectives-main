@@ -1,7 +1,10 @@
 export * from "./adapter";
 export * from "./metadata";
 export * from "./audit";
+export * from "./display";
 export * from "./errors";
+export * from "./junctions";
+export * from "./relations";
 export * from "./service";
 
 // Re-export DSL types so adapter / store packages can pull everything they
@@ -10,6 +13,7 @@ export * from "./service";
 export type {
   ColumnDef,
   ColumnSource,
+  DisplayConfig,
   FilterBarConfig,
   FilterBarField,
   FilterGroup,
@@ -19,5 +23,6 @@ export type {
   PerspectiveBase,
   PerspectiveSqlBase,
   PerspectiveTableBase,
+  RelationDef,
   SortDef,
 } from "@perspectives/dsl";

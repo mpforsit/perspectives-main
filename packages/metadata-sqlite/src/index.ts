@@ -3,7 +3,7 @@ export {
   InMemoryCredentialStore,
   type CredentialStore,
 } from "./credentials";
-export { displayConfigId } from "./display-configs";
+export { DisplayConfigsStore } from "./display-configs";
 export {
   runMigrations,
   type Migration,

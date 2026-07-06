@@ -1,4 +1,4 @@
-import { Binary, Check, Maximize2, Minus } from "lucide-react";
+import { ArrowRight, Binary, Check, Maximize2, Minus } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -181,6 +181,54 @@ function isComposite(value: unknown): boolean {
   if (value === null || value === undefined) return false;
   if (Array.isArray(value)) return true;
   return typeof value === "object";
+}
+
+/**
+ * Forward-FK cell rendering. The parent `<div role="gridcell">` already
+ * owns the click handler (so the entire cell is clickable, not just an
+ * arrow icon); this component just renders the value with a forward-arrow
+ * indicator and a hover treatment that telegraphs "this jumps somewhere".
+ *
+ * We deliberately do NOT render a `<button>` inside the gridcell — the
+ * outer div is the interactive surface, and `<button>` inside `<div role="gridcell">`
+ * would steal focus rules that the grid's arrow-key navigation already
+ * controls.
+ */
+export function LinkCell({
+  dbType,
+  value,
+  onExpand,
+  label,
+}: {
+  dbType: string;
+  value: unknown;
+  onExpand?: () => void;
+  /** When set + non-empty, renders the label in place of the raw FK
+   *  value. Phase 2.5: populated by the caller from `getRowLabels`
+   *  batch fetch. */
+  label?: string | null;
+}) {
+  const showLabel = typeof label === "string" && label.length > 0;
+  return (
+    <span className="inline-flex max-w-full items-center gap-1 text-foreground">
+      <span className="overflow-hidden text-ellipsis whitespace-nowrap font-medium text-primary underline-offset-2 group-hover:underline">
+        {showLabel ? (
+          // The label IS the human-readable target identifier; the raw
+          // FK value is implied. Title attribute exposes the underlying
+          // value on hover for users who need to confirm it.
+          <span title={String(value)}>{label}</span>
+        ) : onExpand === undefined ? (
+          <Cell dbType={dbType} value={value} />
+        ) : (
+          <Cell dbType={dbType} value={value} onExpand={onExpand} />
+        )}
+      </span>
+      <ArrowRight
+        className="h-3 w-3 shrink-0 text-primary/60 transition-colors group-hover:text-primary"
+        aria-hidden
+      />
+    </span>
+  );
 }
 
 /** Exported for tests; renders the expected kind name. */

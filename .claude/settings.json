@@ -42,7 +42,30 @@
       "Bash(pnpm --filter @perspectives/adapter-postgres test -- runtime)",
       "Bash(pnpm --filter @perspectives/adapter-postgres test -- keyset-nulls)",
       "Bash(pnpm --filter @perspectives/desktop test -- csp)",
-      "Bash(pnpm list *)"
+      "Bash(pnpm list *)",
+      "Bash(pnpm --filter @perspectives/metadata-sqlite typecheck)",
+      "Bash(pnpm --filter @perspectives/desktop test -- test/integration.test)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/session/links)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/session/tabs-storage)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/session/inspector.test)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/session/relations/validate)",
+      "Bash(grep -n \"^    </div>$\\\\|^  \\)$\\\\|^}$\" /Users/matthias/Documents/repos/perspectives/apps/desktop/src/renderer/src/session/SessionView.tsx)",
+      "Bash(pnpm --filter @perspectives/desktop test -- src/renderer/src/session/inspector)",
+      "Bash(pnpm -w turbo run typecheck)",
+      "Bash(pnpm --filter @perspectives/desktop test --run src/renderer/src/session/links.test.ts)",
+      "Bash(docker compose *)",
+      "Bash(pnpm --filter @perspectives/desktop test --run test/integration.test.ts)",
+      "Bash(grep -n \"useFkLabels\\\\|linkLabelFor\\\\|DataGrid$\\\\|<DataGrid \" /Users/matthias/Documents/repos/perspectives/apps/desktop/src/renderer/src/session/TableView.tsx)",
+      "Bash(pnpm --filter @perspectives/desktop test --run)",
+      "Bash(pnpm --filter @perspectives/desktop test --run src/renderer/src/session/crumbs.test.ts)",
+      "Bash(pnpm --filter @perspectives/desktop test --run src/renderer/src/session/tabs-storage.test.ts src/renderer/src/session/crumbs.test.ts)",
+      "Bash(pnpm --filter @perspectives/desktop test --run src/renderer/src/session/BreadcrumbBar.test.tsx)",
+      "Bash(pnpm -w turbo run typecheck test)",
+      "Bash(pnpm -w turbo run typecheck test --force)",
+      "Bash(pnpm --filter @perspectives/desktop exec tsc --noEmit -p apps/desktop/tsconfig.json)",
+      "Bash(pnpm run *)",
+      "Skill(run)",
+      "Skill(run:*)"
     ]
   }
 }

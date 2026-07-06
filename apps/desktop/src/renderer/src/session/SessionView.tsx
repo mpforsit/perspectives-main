@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronLeft, FileCode2 } from "lucide-react";
+import { ChevronLeft, FileCode2, GitBranch } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 
 import { trpc } from "../trpc/client";
 
+import { RelationsManager } from "./relations/RelationsManager";
 import { SchemaSidebar } from "./SchemaSidebar";
 import { SqlConsoleView } from "./SqlConsoleView";
 import { TabBar } from "./TabBar";
@@ -49,6 +50,7 @@ export function SessionView({
   // Until the persisted-tab restore round-trip completes, hold off on writing
   // back so we don't clobber the saved payload with the empty initial state.
   const [restored, setRestored] = useState<boolean>(false);
+  const [relationsManagerOpen, setRelationsManagerOpen] = useState<boolean>(false);
 
   // Activate the engine adapter exactly once per connectionId. tRPC's
   // imperative client (via `utils.client`) is stable across renders, so this
@@ -179,12 +181,12 @@ export function SessionView({
 
   return (
     <div className="flex h-screen flex-col">
-      <header className="flex items-center justify-between border-b px-3 py-2">
+      <header className="flex items-center justify-between border-b px-3 py-2 [-webkit-app-region:drag]">
         <Button
           variant="ghost"
           size="sm"
           onClick={handleLeave}
-          className="gap-1.5"
+          className="gap-1.5 [-webkit-app-region:no-drag]"
         >
           <ChevronLeft className="h-4 w-4" aria-hidden />
           Connections
@@ -195,18 +197,30 @@ export function SessionView({
             <span className="text-xs text-muted-foreground">connecting…</span>
           )}
         </div>
-        <div className="flex items-center justify-end gap-1.5" style={{ minWidth: 120 }}>
+        <div className="flex items-center justify-end gap-1.5" style={{ minWidth: 220 }}>
           {connectState.kind === "connected" && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={openSqlConsole}
-              className="h-7 gap-1.5 px-2 text-xs"
-              title="Open a new SQL console (Cmd/Ctrl+N)"
-            >
-              <FileCode2 className="h-3.5 w-3.5" aria-hidden />
-              New SQL
-            </Button>
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setRelationsManagerOpen(true)}
+                className="h-7 gap-1.5 px-2 text-xs [-webkit-app-region:no-drag]"
+                title="Manage relations (schema-derived + custom)"
+              >
+                <GitBranch className="h-3.5 w-3.5" aria-hidden />
+                Relations
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={openSqlConsole}
+                className="h-7 gap-1.5 px-2 text-xs [-webkit-app-region:no-drag]"
+                title="Open a new SQL console"
+              >
+                <FileCode2 className="h-3.5 w-3.5" aria-hidden />
+                New SQL
+              </Button>
+            </>
           )}
         </div>
       </header>
@@ -250,6 +264,17 @@ export function SessionView({
                   connectionId={connectionId}
                   schema={activeTab.schema}
                   table={activeTab.name}
+                  onOpenTab={openTab}
+                />
+              ) : activeTab.kind === "filteredTable" ? (
+                <TableView
+                  key={`filteredTable:${activeTab.id}`}
+                  connectionId={connectionId}
+                  schema={activeTab.schema}
+                  table={activeTab.name}
+                  filter={activeTab.filter}
+                  crumbs={activeTab.crumbs}
+                  onOpenTab={openTab}
                 />
               ) : activeTab.kind === "sql" ? (
                 <SqlConsoleView
@@ -263,6 +288,11 @@ export function SessionView({
           </main>
         </div>
       )}
+      <RelationsManager
+        open={relationsManagerOpen}
+        connectionId={connectionId}
+        onClose={() => setRelationsManagerOpen(false)}
+      />
     </div>
   );
 }

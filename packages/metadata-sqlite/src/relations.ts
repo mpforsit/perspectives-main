@@ -3,13 +3,19 @@ import type Database from "better-sqlite3";
 import { validateRelation, type RelationDef } from "@perspectives/dsl";
 import {
   ValidationError,
-  type CRUDStore,
-  type ListQuery,
+  type RelationsRepository,
 } from "@perspectives/engine";
 
 /**
- * Persists `RelationDef` rows. Identical pattern to `PerspectivesStore`:
- * JSON storage, DSL validation on both sides of the boundary.
+ * Persists `RelationDef` rows scoped by database identity (`scope` =
+ * engine's `relationScopeKey(profile)`).
+ *
+ * Storage layout (from migration 0002):
+ *   relations(id PK, scope TEXT NOT NULL DEFAULT '', payload TEXT, updated_at TEXT)
+ *
+ * Validation lives at both edges: `validateRelation` on every write *and*
+ * every read, so a bit-rotted row surfaces as a typed error instead of a
+ * malformed RelationDef.
  */
 
 interface RelationRow {
@@ -18,25 +24,26 @@ interface RelationRow {
   updated_at: string;
 }
 
-export class RelationsStore implements CRUDStore<RelationDef> {
-  private readonly insertStmt: Database.Statement<[string, string, string]>;
+export class RelationsStore implements RelationsRepository {
+  private readonly insertStmt: Database.Statement<[string, string, string, string]>;
   private readonly updateStmt: Database.Statement<[string, string, string]>;
   private readonly selectByIdStmt: Database.Statement<[string], RelationRow>;
-  private readonly selectAllStmt: Database.Statement<[], RelationRow>;
+  private readonly selectByScopeStmt: Database.Statement<[string], RelationRow>;
   private readonly deleteStmt: Database.Statement<[string]>;
 
   constructor(private readonly db: Database.Database) {
     this.insertStmt = this.db.prepare(
-      `INSERT INTO relations (id, payload, updated_at) VALUES (?, ?, ?)`,
+      `INSERT INTO relations (id, scope, payload, updated_at) VALUES (?, ?, ?, ?)`,
     );
     this.updateStmt = this.db.prepare(
       `UPDATE relations SET payload = ?, updated_at = ? WHERE id = ?`,
     );
     this.selectByIdStmt = this.db.prepare<[string], RelationRow>(
-      `SELECT * FROM relations WHERE id = ?`,
+      `SELECT id, payload, updated_at FROM relations WHERE id = ?`,
     );
-    this.selectAllStmt = this.db.prepare<[], RelationRow>(
-      `SELECT * FROM relations ORDER BY updated_at DESC, id ASC`,
+    this.selectByScopeStmt = this.db.prepare<[string], RelationRow>(
+      `SELECT id, payload, updated_at FROM relations WHERE scope = ?
+       ORDER BY updated_at DESC, id ASC`,
     );
     this.deleteStmt = this.db.prepare(`DELETE FROM relations WHERE id = ?`);
   }
@@ -47,11 +54,11 @@ export class RelationsStore implements CRUDStore<RelationDef> {
     return parseAndValidate(row);
   }
 
-  async list(_query?: ListQuery): Promise<RelationDef[]> {
-    return this.selectAllStmt.all().map(parseAndValidate);
+  async listForScope(scope: string): Promise<RelationDef[]> {
+    return this.selectByScopeStmt.all(scope).map(parseAndValidate);
   }
 
-  async create(value: RelationDef): Promise<RelationDef> {
+  async create(scope: string, value: RelationDef): Promise<RelationDef> {
     const result = validateRelation(value);
     if (!result.ok) {
       throw new ValidationError(
@@ -61,6 +68,7 @@ export class RelationsStore implements CRUDStore<RelationDef> {
     }
     this.insertStmt.run(
       result.value.id,
+      scope,
       JSON.stringify(result.value),
       result.value.updatedAt,
     );

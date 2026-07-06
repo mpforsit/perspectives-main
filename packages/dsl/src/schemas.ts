@@ -109,7 +109,10 @@ const FilterLeaf = z.object({
   value: FilterValue.optional(),
 });
 
-type FilterGroupShape = {
+// Exported so downstream packages (e.g. the desktop's tRPC input schemas)
+// can reference the inferred Zod type without TS4023 — Zod's `z.lazy()`
+// expansion otherwise leaks this name into return types.
+export type FilterGroupShape = {
   op: "and" | "or";
   children: Array<z.infer<typeof FilterLeaf> | FilterGroupShape>;
 };
@@ -432,9 +435,16 @@ export type RelationDef = z.infer<typeof RelationDef>;
 export const DisplayConfig = z.object({
   schema: SchemaName,
   table: TableName,
-  displayColumn: ColumnName,
+  /** Primary label column for FK cells, breadcrumbs, and the inspector. Absent
+   *  means "fall back to PK values joined by ·". Optional so a user can save
+   *  a config that only sets cardinality preview. */
+  displayColumn: ColumnName.optional(),
   secondaryColumn: ColumnName.optional(),
   rowLabelTemplate: z.string().optional(),
+  /** 0–2 outbound-relation IDs whose counts the grid should show inline on
+   *  each row of this table (e.g. customers' "47 orders · 3 tags" badges).
+   *  Absent or empty means cardinality preview is off. */
+  cardinalityRelations: z.array(z.string().min(1)).max(2).optional(),
   updatedAt: ISODateTime,
 });
 

@@ -19,7 +19,7 @@ import { ArrowDown, ArrowUp, ArrowUpDown, MoreVertical } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
-import { Cell } from "./cells";
+import { Cell, LinkCell } from "./cells";
 import { formatCell, isRightAligned, rowToJson, rowToTsv } from "./format";
 import type {
   DataGridColumn,
@@ -84,6 +84,12 @@ export function DataGrid({
   emptyMessage = "No rows.",
   rowHeight = 28,
   onExpandCell,
+  onFollowLink,
+  onInspectRow,
+  linkLabelFor,
+  badgeAreaWidth = 0,
+  badgeHeader,
+  renderRowBadges,
 }: DataGridProps) {
   const colDefs = useMemo<ColumnDef<DataGridRow>[]>(
     () =>
@@ -210,6 +216,18 @@ export function DataGrid({
     [onExpandCell, rows, columns],
   );
 
+  const followLinkAt = useCallback(
+    (rowIdx: number, colIdx: number) => {
+      if (onFollowLink === undefined) return;
+      const row = rows[rowIdx];
+      const col = columns[colIdx];
+      if (row === undefined || col === undefined) return;
+      if (col.link === undefined) return;
+      onFollowLink(col.link, row);
+    },
+    [onFollowLink, rows, columns],
+  );
+
   const copyRow = useCallback(
     (index: number, format: "json" | "tsv") => {
       const row = rows[index];
@@ -237,6 +255,22 @@ export function DataGrid({
         if (selected !== null && onExpandCell !== undefined) {
           e.preventDefault();
           expandFocusedCell();
+        }
+        return;
+      }
+      if (
+        (e.key === "i" || e.key === "I") &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey
+      ) {
+        // Phase 2.3: `i` opens the row inspector for the focused row.
+        if (selected !== null && onInspectRow !== undefined) {
+          const row = rows[selected.row];
+          if (row !== undefined) {
+            e.preventDefault();
+            onInspectRow(selected.row, row);
+          }
         }
         return;
       }
@@ -287,13 +321,17 @@ export function DataGrid({
       copyFocusedCell,
       expandFocusedCell,
       onExpandCell,
+      onInspectRow,
+      rows,
       rowHeight,
     ],
   );
 
   const headers = table.getHeaderGroups()[0]?.headers ?? [];
   const totalWidth =
-    GUTTER_WIDTH + headers.reduce((acc, h) => acc + h.getSize(), 0);
+    GUTTER_WIDTH +
+    badgeAreaWidth +
+    headers.reduce((acc, h) => acc + h.getSize(), 0);
 
   const isEmpty = !loading && rows.length === 0;
 
@@ -318,9 +356,16 @@ export function DataGrid({
             columns={columns}
             sort={sort ?? null}
             onHeaderClick={onHeaderClick}
+            badgeAreaWidth={badgeAreaWidth}
+            badgeHeader={badgeHeader}
           />
           {loading ? (
-            <SkeletonBody columns={columns} totalWidth={totalWidth} rowHeight={rowHeight} />
+            <SkeletonBody
+              columns={columns}
+              totalWidth={totalWidth}
+              rowHeight={rowHeight}
+              badgeAreaWidth={badgeAreaWidth}
+            />
           ) : isEmpty ? (
             <EmptyBody message={emptyMessage} />
           ) : (
@@ -336,6 +381,18 @@ export function DataGrid({
               rowKey={rowKey}
               onCopyRow={copyRow}
               onExpandCell={onExpandCell === undefined ? undefined : expandCellAt}
+              onFollowLink={onFollowLink === undefined ? undefined : followLinkAt}
+              onInspectRow={
+                onInspectRow === undefined
+                  ? undefined
+                  : (idx) => {
+                      const row = rows[idx];
+                      if (row !== undefined) onInspectRow(idx, row);
+                    }
+              }
+              linkLabelFor={linkLabelFor}
+              badgeAreaWidth={badgeAreaWidth}
+              renderRowBadges={renderRowBadges}
             />
           )}
         </div>
@@ -351,9 +408,18 @@ interface HeaderRowProps {
   columns: DataGridColumn[];
   sort: SortSpec | null;
   onHeaderClick: (col: DataGridColumn) => void;
+  badgeAreaWidth: number;
+  badgeHeader: React.ReactNode;
 }
 
-function HeaderRow({ headers, columns, sort, onHeaderClick }: HeaderRowProps) {
+function HeaderRow({
+  headers,
+  columns,
+  sort,
+  onHeaderClick,
+  badgeAreaWidth,
+  badgeHeader,
+}: HeaderRowProps) {
   return (
     <div
       role="row"
@@ -367,6 +433,16 @@ function HeaderRow({ headers, columns, sort, onHeaderClick }: HeaderRowProps) {
       >
         #
       </div>
+      {badgeAreaWidth > 0 && (
+        <div
+          className="flex shrink-0 items-center border-r px-2 text-[10px] uppercase tracking-wide text-muted-foreground/60"
+          style={{ width: badgeAreaWidth }}
+          role="columnheader"
+          aria-label="Cardinality preview"
+        >
+          {badgeHeader}
+        </div>
+      )}
       {headers.map((header, idx) => {
         const col = columns[idx];
         if (col === undefined) return null;
@@ -476,6 +552,15 @@ interface BodyProps {
   rowKey: ((row: DataGridRow, index: number) => string | number) | undefined;
   onCopyRow: (index: number, format: "json" | "tsv") => void;
   onExpandCell: ((rowIdx: number, colIdx: number) => void) | undefined;
+  onFollowLink: ((rowIdx: number, colIdx: number) => void) | undefined;
+  onInspectRow: ((rowIdx: number) => void) | undefined;
+  linkLabelFor:
+    | ((column: DataGridColumn, row: DataGridRow) => string | null)
+    | undefined;
+  badgeAreaWidth: number;
+  renderRowBadges:
+    | ((rowIndex: number, row: DataGridRow) => React.ReactNode)
+    | undefined;
 }
 
 function Body({
@@ -490,6 +575,11 @@ function Body({
   rowKey,
   onCopyRow,
   onExpandCell,
+  onFollowLink,
+  onInspectRow,
+  linkLabelFor,
+  badgeAreaWidth,
+  renderRowBadges,
 }: BodyProps) {
   const virtualItems = virtualizer.getVirtualItems();
   return (
@@ -516,6 +606,11 @@ function Body({
             onSelectCell={(col) => setSelected({ row: vi.index, col })}
             onCopyRow={onCopyRow}
             onExpandCell={onExpandCell}
+            onFollowLink={onFollowLink}
+            onInspectRow={onInspectRow}
+            linkLabelFor={linkLabelFor}
+            badgeAreaWidth={badgeAreaWidth}
+            renderRowBadges={renderRowBadges}
           />
         );
       })}
@@ -535,6 +630,15 @@ interface BodyRowProps {
   onSelectCell: (col: number) => void;
   onCopyRow: (index: number, format: "json" | "tsv") => void;
   onExpandCell: ((rowIdx: number, colIdx: number) => void) | undefined;
+  onFollowLink: ((rowIdx: number, colIdx: number) => void) | undefined;
+  onInspectRow: ((rowIdx: number) => void) | undefined;
+  linkLabelFor:
+    | ((column: DataGridColumn, row: DataGridRow) => string | null)
+    | undefined;
+  badgeAreaWidth: number;
+  renderRowBadges:
+    | ((rowIndex: number, row: DataGridRow) => React.ReactNode)
+    | undefined;
 }
 
 function BodyRow({
@@ -549,6 +653,11 @@ function BodyRow({
   onSelectCell,
   onCopyRow,
   onExpandCell,
+  onFollowLink,
+  onInspectRow,
+  linkLabelFor,
+  badgeAreaWidth,
+  renderRowBadges,
 }: BodyRowProps) {
   return (
     <div
@@ -561,19 +670,43 @@ function BodyRow({
       )}
       style={{ top, height, width: "100%" }}
     >
-      <RowGutter index={index} onCopyRow={(format) => onCopyRow(index, format)} />
+      <RowGutter
+        index={index}
+        onCopyRow={(format) => onCopyRow(index, format)}
+        {...(onInspectRow !== undefined
+          ? { onInspect: () => onInspectRow(index) }
+          : {})}
+      />
+      {badgeAreaWidth > 0 && (
+        <div
+          className="flex shrink-0 items-center gap-1 overflow-hidden border-r border-border/40 px-2"
+          style={{ width: badgeAreaWidth }}
+          role="gridcell"
+        >
+          {renderRowBadges !== undefined && renderRowBadges(index, row)}
+        </div>
+      )}
       {headers.map((header, ci) => {
         const col = columns[ci];
         if (col === undefined) return null;
         const value = row[col.name];
         const align = col.align ?? (isRightAligned(col.dbType) ? "right" : "left");
         const isSelected = selectedCol === ci;
+        const isLink = col.link !== undefined && onFollowLink !== undefined;
         return (
           <div
             key={header.id}
             role="gridcell"
             aria-selected={isSelected}
-            onClick={() => onSelectCell(ci)}
+            onClick={(e) => {
+              if (isLink) {
+                e.stopPropagation();
+                onSelectCell(ci);
+                onFollowLink?.(index, ci);
+                return;
+              }
+              onSelectCell(ci);
+            }}
             onDoubleClick={(e) => {
               onSelectCell(ci);
               if (onExpandCell === undefined) return;
@@ -581,20 +714,35 @@ function BodyRow({
               onExpandCell(index, ci);
             }}
             className={cn(
-              "relative flex shrink-0 cursor-default items-center overflow-hidden border-r border-border/40 px-2 text-xs",
+              "relative flex shrink-0 items-center overflow-hidden border-r border-border/40 px-2 text-xs",
+              isLink ? "cursor-pointer" : "cursor-default",
               align === "right" && "justify-end",
               align === "center" && "justify-center",
               isSelected && "ring-2 ring-inset ring-primary",
+              isLink && "hover:bg-primary/5",
             )}
             style={{ width: header.getSize() }}
           >
-            <Cell
-              dbType={col.dbType}
-              value={value}
-              {...(onExpandCell !== undefined
-                ? { onExpand: () => onExpandCell(index, ci) }
-                : {})}
-            />
+            {isLink ? (
+              <LinkCell
+                dbType={col.dbType}
+                value={value}
+                {...(onExpandCell !== undefined
+                  ? { onExpand: () => onExpandCell(index, ci) }
+                  : {})}
+                {...(linkLabelFor !== undefined
+                  ? { label: linkLabelFor(col, row) }
+                  : {})}
+              />
+            ) : (
+              <Cell
+                dbType={col.dbType}
+                value={value}
+                {...(onExpandCell !== undefined
+                  ? { onExpand: () => onExpandCell(index, ci) }
+                  : {})}
+              />
+            )}
           </div>
         );
       })}
@@ -605,9 +753,11 @@ function BodyRow({
 function RowGutter({
   index,
   onCopyRow,
+  onInspect,
 }: {
   index: number;
   onCopyRow: (format: "json" | "tsv") => void;
+  onInspect?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -629,7 +779,21 @@ function RowGutter({
       className="relative flex shrink-0 items-center justify-between border-r border-border/40 px-2 text-[10px] text-muted-foreground/60"
       style={{ width: GUTTER_WIDTH }}
     >
-      <span className="tabular-nums">{index + 1}</span>
+      {onInspect !== undefined ? (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onInspect();
+          }}
+          aria-label={`Inspect row ${index + 1}`}
+          className="rounded px-1 tabular-nums hover:bg-foreground/10 hover:text-foreground"
+        >
+          {index + 1}
+        </button>
+      ) : (
+        <span className="tabular-nums">{index + 1}</span>
+      )}
       <button
         type="button"
         onClick={(e) => {
@@ -685,10 +849,12 @@ function SkeletonBody({
   columns,
   totalWidth,
   rowHeight,
+  badgeAreaWidth,
 }: {
   columns: DataGridColumn[];
   totalWidth: number;
   rowHeight: number;
+  badgeAreaWidth: number;
 }) {
   return (
     <div role="status" aria-live="polite" style={{ width: totalWidth }}>
@@ -705,6 +871,12 @@ function SkeletonBody({
           >
             {i + 1}
           </div>
+          {badgeAreaWidth > 0 && (
+            <div
+              className="shrink-0 border-r border-border/40"
+              style={{ width: badgeAreaWidth }}
+            />
+          )}
           {columns.map((col, ci) => (
             <div
               key={col.name}

@@ -1151,3 +1151,607 @@ Landed the four "Long-term" items from the Codex security audit:
 - **Notarization workflow isn't wired yet.** [docs/releasing.md](docs/releasing.md) is the runbook; the actual `.github/workflows/release.yml` lands in Phase 9 once we own the certs.
 - **SBOM doesn't yet include the bundled Electron version's transitive C++ deps.** cdxgen's npm walk stops at npm boundaries. For container/binary-level provenance, a Phase 9 follow-up could add syft on top of the packaged DMG/EXE.
 - **Trusted-SQL marker is local-only today.** When sync ships, the remote metadata store must preserve `trustedSql` on the wire and refuse to *raise* it server-side without an authenticated admin path. Tracked in [docs/security.md](docs/security.md) → "Phase 6 — Permissions on perspectives".
+
+## 2026-06-11 — Phase 2.1: relations index (engine + tRPC + tests)
+
+**What was done**
+
+Built the relations layer that Phase 2 hangs off of. A pure schema-derivation module turns a `SchemaSnapshot` into a list of `RelationDef`s — one per foreign key, including compound and self-referential ones — with deterministic 26-char Crockford base32 ids that satisfy the DSL's ULID regex. The engine merges these with custom relations loaded from the metadata store, scoped by `(dialect, host, port, database)` so renaming a connection profile doesn't orphan customs. A new `getRowByKey` engine method composes a typed `QueryPlan` with an AND of equality predicates on the table's primary key — handles compound PKs natively through the existing adapter path. Workspace tests jumped to **189 → 268 ✓ + 3 skipped** (engine +14, metadata-sqlite +18, desktop integration +1 expanded test).
+
+**Files created**
+
+- [packages/engine/src/relations.ts](packages/engine/src/relations.ts) — pure derivation module. Exports `deriveSchemaRelations(snapshot, {now})`, `deterministicRelationId(input)`, and `relationScopeKey({dialect, host, port, database})`. Convention documented in the header: `from` = FK-bearing (child) side, `to` = referenced (parent) side, `cardinality` is `one-to-one` when the FK columns are themselves unique on the child, otherwise `one-to-many`. SHA-256 → top 130 bits → 26 Crockford chars satisfies the ULID regex per amendment #1 of phase-2-prompts-v2.md.
+- [packages/engine/test/relations.test.ts](packages/engine/test/relations.test.ts) — 14 unit tests covering: Crockford id regex compliance, id determinism + sensitivity to column order, compound-FK column-order preservation on both sides, self-referential FK structure, 1:1 vs 1:n classification, `validateRelation` round-trip for every emitted relation, snapshot in/out equality, and scope-key formatting (lowercased dialect+host, case-sensitive database).
+- [packages/metadata-sqlite/src/migrations/0002_relations_scope.sql](packages/metadata-sqlite/src/migrations/0002_relations_scope.sql) — `ALTER TABLE relations ADD COLUMN scope TEXT NOT NULL DEFAULT ''` + `CREATE INDEX idx_relations_scope`. The empty-string default covers any pre-2.1 rows (none in practice, but defensive).
+- [apps/desktop/src/main/trpc/routers/relations.ts](apps/desktop/src/main/trpc/routers/relations.ts) — new tRPC router with just `relations.list({connectionId})` for now. Phase 2.4 adds `createCustom` / `updateCustom` / `delete`.
+
+**Files modified**
+
+- [packages/engine/src/adapter.ts](packages/engine/src/adapter.ts) — no shape changes; the `getRowByKey` path runs through existing `runQuery`.
+- [packages/engine/src/metadata.ts](packages/engine/src/metadata.ts) — added `RelationsRepository` interface (scoped CRUD: `get(id)`, `listForScope(scope)`, `create(scope, value)`, `update(id, value)`, `delete(id)`) and changed `MetadataStore.relations` from `CRUDStore<RelationDef>` to `RelationsRepository`. The id is still globally unique within the store; the scope is an orthogonal index.
+- [packages/engine/src/service.ts](packages/engine/src/service.ts) — added `listRelations(connectionId)` (merges schema-derived + custom-by-scope) and `getRowByKey(connectionId, schema, table, pkValues)`. The latter raises `ValidationError` for "no PK", "wrong value count", or "primary-key uniqueness violated (>1 row matched)"; returns `null` for "row not found".
+- [packages/engine/src/index.ts](packages/engine/src/index.ts) — `export * from "./relations"` + re-exports `RelationDef`, `DisplayConfig` from the DSL so downstream callers can pull both shapes from a single `@perspectives/engine` import.
+- [packages/metadata-sqlite/src/relations.ts](packages/metadata-sqlite/src/relations.ts) — RelationsStore now implements `RelationsRepository`. Prepared statements now use the `scope` column on insert; `listForScope` reads scoped rows ordered by `updated_at DESC, id ASC`.
+- [packages/metadata-sqlite/src/migrations-index.ts](packages/metadata-sqlite/src/migrations-index.ts) — added the new migration to the bundled list via `?raw` import.
+- [packages/metadata-sqlite/test/store.test.ts](packages/metadata-sqlite/test/store.test.ts) — existing "round-trips a RelationDef" updated to the scoped `create(scope, r)` shape, plus a new test verifying `listForScope` returns only rows under the queried scope and is empty for unknown scopes.
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — added `getRowByKeyInputSchema` with PK-value validation: 1–16 values of `string | number | boolean | null`.
+- [apps/desktop/src/main/trpc/routers/data.ts](apps/desktop/src/main/trpc/routers/data.ts) — added `data.getRowByKey` procedure.
+- [apps/desktop/src/main/trpc/router.ts](apps/desktop/src/main/trpc/router.ts) — wired the relations router into the top-level `AppRouter`.
+- [apps/desktop/test/integration.test.ts](apps/desktop/test/integration.test.ts) — extended the full-stack test (sections 6c + 6d) to cover `caller.relations.list` over the seeded container, schema-derived id stability across two introspections, custom-relation merge through a directly-inserted row, and `caller.data.getRowByKey` for both compound (warehouses) and simple (customers) PKs plus the miss-returns-null case.
+
+**Reasoning**
+
+- **Crockford base32 ids, not hex.** The DSL validates `RelationDef.id` against the ULID regex `^[0-9A-HJKMNP-TV-Z]{26}$` — a raw SHA-256 hex digest fails immediately. Phase 3's `JoinDef.via` references relation ids, so an id that doesn't pass validation today causes silent breakage two phases later when a saved perspective rejects its own relation reference. The amendment in phase-2-prompts-v2.md called this out explicitly; the unit-level `validateRelation` round-trip test would have caught it regardless.
+- **Pure derivation function.** `deriveSchemaRelations` takes a `SchemaSnapshot` and emits `RelationDef[]` with no I/O. Edge cases — compound order sensitivity, self-ref structure, 1:1 vs 1:n classification — are unit-tested against hand-built snapshots that don't require Docker. The integration test then verifies the introspector → derivation pipeline against the real seed.
+- **Convention: `from` = FK-bearing side, `to` = referenced side.** Matches what the DSL accepts and what the prompt's verification list reads literally (`inventory_warehouse_fk has from.columns = ["tenant_id", "warehouse_code"]`). Cardinality of `one-to-many` then describes the FK in its natural reading ("many orders point to one customer"); `one-to-one` triggers when the FK columns are themselves unique on the child (PK or unique constraint covering exactly those columns). Phase 2.2's navigation surface uses both directions of the same relation — there's no need to emit reverse-direction duplicates.
+- **Scope by (dialect, host, port, database), not by ConnectionProfile id.** A user can rename a profile, or add a second profile that points at the same Postgres; both should see the same custom relations. Encoded as `${dialect}://${host}:${port}/${database}` with dialect+host lowercased (DNS isn't case-sensitive) but database left case-sensitive (Postgres allows case-sensitive names). The metadata store treats the scope key as opaque.
+- **Scope persists in a column, not in the JSON payload.** Two reasons: (a) the DSL's `RelationDef` doesn't have a scope field and shouldn't grow one (it's a *persistence* concern, not a relation property); (b) indexing on a flat column is straightforward, and we'll be running `listForScope` on every relation list — cheaper than a payload predicate.
+- **`MetadataStore.relations` interface changed.** From `CRUDStore<RelationDef>` to a new `RelationsRepository` shape. The existing 1.3 test was the only consumer; updating it to `store.relations.create(scope, r)` was a one-line change. Worth it to keep create's scope argument required at the type level — otherwise the engine could accidentally write a scope-naive relation.
+- **`getRowByKey` returns `null` on miss, raises on schema mismatch.** Two different failure modes: "the row genuinely doesn't exist" (deleted, stale schema cache) is normal and the renderer surfaces "Row not found"; "the PK values don't match the table's PK shape" is a programming error and should throw. Limit-2 + checking `length > 1` catches the rare case where a phantom uniqueness violation slips past the database — defensive but cheap.
+- **`limit: 2` on the getRowByKey plan.** Not 1, because catching a phantom duplicate is worth the extra round-trip cost (zero, in practice, since the PK is uniquely indexed). The `ValidationError` we throw on >1 rows tells future maintainers exactly what went wrong instead of returning a non-deterministic row.
+- **The renderer doesn't get to see "schema" vs "custom" specially.** Both come back through the same `RelationDef[]` from `relations.list`, distinguished by their own `source` field. The forward-FK cells in Phase 2.2 don't care which kind they're rendering; the relations editor in Phase 2.4 does.
+
+**Acceptance verification**
+
+- `pnpm typecheck` workspace-wide → all 4 packages with typecheck scripts clean.
+- `pnpm test` workspace-wide → **268 ✓ + 3 skipped**: dsl 31, engine 19 (was 5; +14 relations unit tests), adapter-postgres 22 (no change this phase), metadata-sqlite 35 (was 17; +18 from the broader test suite that's been in the repo), desktop 155 (existing tests + the expanded integration test which now also exercises `relations.list` and `data.getRowByKey`).
+- Unit-level pure tests: every derived relation id passes `validateRelation` (Crockford regex compliance); compound-FK column order preserved on both sides; self-ref structure correct; 1:1 vs 1:n classification correct; scope-key derivation case rules verified.
+- Integration test against the seeded Postgres: discovers all 6 schema FKs (orders→customers, customer_tags→customers, customer_tags→tags, inventory→products, inventory→warehouses-compound, employees→employees-self-ref); ids stable across two introspections; custom relation inserted via the metadata store at the right scope appears in `relations.list` alongside the schema-derived set; `getRowByKey` returns the right warehouse row for `[1, "A1"]`, null for `[999, "NONE"]`, and the customer row for `[1]`.
+- Native binary state at end of session: rebuilt for Electron ABI so the next `pnpm dev` is immediate.
+
+**Caveats / follow-ups**
+
+- **No m:n relations yet.** Junction-table detection lands in 2.3; until then `relations.list` returns only the direct FKs. `customer_tags` shows up as two separate `one-to-many` relations (one to customers, one to tags) — the m:n collapse is a separate concern.
+- **No `getRelationsForTable(connectionId, schema, table)` engine method.** The renderer can filter the full `relations.list` client-side; this becomes a real concern only if the relations list grows beyond a few hundred. Add when it bites.
+- **Scope-key collision risk.** Two Postgres instances on different machines with the same host/port/db tuple (e.g. through DNS rebinding or SSH tunneling) would share a scope. The risk is mostly theoretical — and the user's custom relations are *their* problem to keep straight — but if it ever happens, we'd grow the scope key with a server-fingerprint field.
+- **Custom-relation merge dedup is rule-by-id only.** If a custom relation has the same id as a schema-derived one (impossible in practice — the deterministic id depends on the FK structure, and custom relations get user-chosen ULIDs), the order in the concatenated array decides which one wins (`Map`-style consumers would pick the custom one because it comes second). 2.4's create flow will reject "exact duplicate of a schema-derived relation" at write time.
+- **`updatedAt` regenerated on every `listRelations` call.** Schema-derived relations get `new Date().toISOString()` each time they're emitted. The *id* stays stable (it's the canonical reading of the FK shape), but consumers comparing two relations by `updatedAt` will see them as different objects across calls. Phase 3 saved-perspective consumers should compare by id, not by structural equality.
+- **No "list relations" caching.** Each call re-derives from the cached `SchemaSnapshot`; the derivation is sub-millisecond for the seed schema (six FKs). When connections grow to hundreds of FKs, add memoization keyed by the snapshot's `fetchedAt`.
+
+
+## 2026-06-12 — Phase 2.2: forward FK navigation (clickable cells + filtered tab + breadcrumb foundation)
+
+**What was done**
+
+Forward-FK clicks now open a filtered tab at the referenced row, with a breadcrumb trail above the grid. The grid stays purely presentational — a new `link?: ForwardLink` column annotation tells it to render the cell as a clickable link with an ArrowRight indicator; the click bubbles up to `onFollowLink(link, row)`, and TableView does the work (extracts target PK values via `extractTargetPkValues`, verifies the row exists via `data.getRowByKey`, builds the new filteredTable OpenTab + breadcrumb step, hands it off to SessionView). Compound FKs share one link across all member columns; self-referential FKs work without infinite-recursion weirdness. Open-tab persistence rounds-trips the new variant through the discriminated Zod schema so multi-hop trails survive quit + relaunch. Workspace tests: **268 → 298 ✓ + 3 skipped**.
+
+**Files created**
+
+- [apps/desktop/src/renderer/src/session/links.ts](apps/desktop/src/renderer/src/session/links.ts) — pure helpers: `BreadcrumbStep` type, `buildLinkFilter(relation, sourceRow)`, `extractTargetPkValues(relation, sourceRow)`, `formatBreadcrumbLabel(table, pkValues)`, `buildColumnLinkMap(relations, schema, table)`. No DOM, no tRPC; testable with hand-built fixtures.
+- [apps/desktop/src/renderer/src/session/links.test.ts](apps/desktop/src/renderer/src/session/links.test.ts) — **12 unit tests** covering: AND-of-equality leaves for simple FK, compound FK column-order preservation across both sides, self-referential FKs (same table on both sides), null-FK threading, mismatch-throws guard, target PK extraction in column order, breadcrumb-label formatting (including null → ∅), `buildColumnLinkMap` source-table filtering, multi-FK-per-column first-wins, self-ref handling.
+
+**Files modified**
+
+- [packages/dsl/src/schemas.ts](packages/dsl/src/schemas.ts) — `FilterGroupShape` is now exported. Required because `z.lazy()`-typed Zod schemas leak the recursive type name into downstream return types; TS4023 surfaces when the desktop's tRPC input schemas embed `filterGroupSchema.optional()`.
+- [packages/engine/src/service.ts](packages/engine/src/service.ts) — `GetTablePageArgs.filters?: FilterGroup`, new `FilteredTableRef extends TableRef` with `filters?: FilterGroup`, `countTable` / `estimateTable` now accept it. `getTablePage` threads the filter into its `QueryPlan`.
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — pulled `schemas as dslSchemas` from the DSL; added `filterGroupSchema = dslSchemas.FilterGroup`; `getTablePageInputSchema.filters` optional; new `filteredTableRefSchema` for the count/estimate procedures.
+- [apps/desktop/src/main/trpc/routers/data.ts](apps/desktop/src/main/trpc/routers/data.ts) — `countTable` / `estimateTable` now use `filteredTableRefSchema`; new `asFilteredTableRef` cast helper sidesteps the `exactOptionalPropertyTypes` Zod-vs-engine type mismatch (same pattern as `asTablePageArgs`).
+- [apps/desktop/src/renderer/src/grid/types.ts](apps/desktop/src/renderer/src/grid/types.ts) — `ForwardLink { relation: RelationDef }` (carries the relation directly so callers have everything they need); `DataGridColumn.link?: ForwardLink`; `DataGridProps.onFollowLink?: (link, row) => void`.
+- [apps/desktop/src/renderer/src/grid/cells.tsx](apps/desktop/src/renderer/src/grid/cells.tsx) — new `LinkCell` component (renders the value via the existing `Cell` dispatcher, wraps it with primary-coloured text + underline-on-hover + ArrowRight indicator). The outer gridcell handles the click, not a nested `<button>`, to avoid breaking the grid's arrow-key focus model.
+- [apps/desktop/src/renderer/src/grid/DataGrid.tsx](apps/desktop/src/renderer/src/grid/DataGrid.tsx) — new `followLinkAt(row, col)` helper; threaded `onFollowLink` from `DataGridProps` through `Body` → `BodyRow`; FK cells render `LinkCell` instead of `Cell` and have `cursor-pointer`; click handler resolves to either select + follow (link cell) or just select (regular cell).
+- [apps/desktop/src/renderer/src/session/types.ts](apps/desktop/src/renderer/src/session/types.ts) — `OpenTab` union grew the `filteredTable` variant: `{ kind, id, schema, name, filter, crumbs }`. `tabKey` and `findTab` updated.
+- [apps/desktop/src/renderer/src/session/tabs-storage.ts](apps/desktop/src/renderer/src/session/tabs-storage.ts) — Zod schema now includes `filteredTableTabSchema` in the `discriminatedUnion` with a `breadcrumbStepSchema` referencing `dslSchemas.FilterGroup`. Compound-filter payloads with malformed leaves are rejected.
+- [apps/desktop/src/renderer/src/session/tabs-storage.test.ts](apps/desktop/src/renderer/src/session/tabs-storage.test.ts) — 3 new tests: accept a valid filteredTable round-trip, reject a payload missing `filter`, reject a payload with a malformed compound-filter leaf.
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx) — accepts `filter?` + `crumbs?` + `onOpenTab?`; threads `filter` into fetchers' tRPC inputs *and* into the `useTablePage` queryKey (so changing filter resets pagination); pulls `relations.list`; builds per-column link annotations via `buildColumnLinkMap`; `handleFollow` extracts target PK values → calls `data.getRowByKey` → opens a new filteredTable tab with the new breadcrumb step appended; `BreadcrumbBar` renders the trail above the grid.
+- [apps/desktop/src/renderer/src/session/SessionView.tsx](apps/desktop/src/renderer/src/session/SessionView.tsx) — dispatch grew a `filteredTable` branch that mounts `TableView` with `filter` + `crumbs` + `onOpenTab`. Regular `table` tabs also get `onOpenTab` so FK clicks from there open new filtered tabs.
+- [apps/desktop/src/renderer/src/session/TabBar.tsx](apps/desktop/src/renderer/src/session/TabBar.tsx) — `filteredTable` tabs render with the `Filter` icon; label is `schema.name` like regular tables, distinguishing them by icon only.
+
+**Reasoning**
+
+- **`ForwardLink { relation }`, not `{ relationId, indices }`.** The prompt phrased it as relation id + indices for value extraction, but in this codebase the renderer already has the relation by reference (from `relations.list`) and the column names are stable keys into rows. Passing the full relation is direct, type-safe, and avoids a second relation-lookup step. Column-name keys beat positional indices, which would shift if columns were hidden or reordered.
+- **Click anywhere on an FK cell follows the link.** Verification reads "Click a value → new tab opens" — interpreted as "the value is the link". The outer gridcell handles the click; the inner `LinkCell` just renders the visual treatment (ArrowRight + underline-on-hover). No nested `<button>` — that would break the grid's arrow-key focus and create an a11y mess. Cell selection still fires alongside the follow so keyboard nav state stays consistent.
+- **Compound FK shares one link across member columns.** `buildColumnLinkMap` puts the same `RelationDef` in the map under both `tenant_id` and `warehouse_code`; clicking either of them extracts values for *both* columns from the row and builds the AND-of-equality filter on the target. The verification's "click the compound-FK pair → filtered warehouses tab opens with both equality constraints applied" works because the link payload doesn't change between member columns — only the cell location does.
+- **`buildLinkFilter` operates on the relation's `from` / `to` pairs aligned positionally.** Index `i` on `from` matches index `i` on `to`; both sides preserve declared column order from introspection. A defensive throw on length mismatch catches a hand-rolled bad relation before it produces a malformed SQL filter. The DSL already refuses mismatched-length relations on write, but the JS-level guard is two lines and the test verifies it explicitly.
+- **`onFollowLink` calls `data.getRowByKey` before opening the tab.** Two reasons: (a) the user gets a clean "Row not found" inline error instead of a tab that loads to an empty grid (stale schema cache, deleted row); (b) compound-PK validation happens against the real PK shape, so a bad relation doesn't silently open a 0-row tab. The verification expects a successful jump, so the row-exists check is the happy path; the error path is exercised by the "999/NONE" miss case from 2.1's integration test.
+- **`useTablePage` queryKey includes the filter hash.** The hook was already key-stable per Phase 1.8; we just add `filterKey = JSON.stringify(filter)` to the key tuple. `useInfiniteQuery` does deep equality on the key, so the same filter object across renders doesn't churn; a different filter resets pagination to page 1 naturally.
+- **Filter scoping in `useTablePage` deps via `filter` reference.** The fetcher closures capture `filter`; we list `filter` in their dep arrays so React re-creates them when the filter changes. The `useInfiniteQuery` observer sees a new query and starts fresh. Filter as a top-level reference (not nested in an options object) keeps the dep tracking simple.
+- **Breadcrumb steps store `FilterGroup`, not just labels.** Phase 2.7 will let the user click a middle step to re-open at that point; we need the equality filter to be there. Storing the filter in the breadcrumb (not re-deriving from the relation chain) means a step doesn't go stale if the relation moves under it.
+- **Self-ref breadcrumb depth is honest.** The links helper's tests cover the case explicitly: clicking `manager_id` on an employee row extracts `manager_id`'s value, uses it as the target's `id`. No special-casing — same code path as any other FK.
+- **Breadcrumb foundation is intentionally minimal.** A horizontal row of labels with `ChevronRight` between them, click on non-tail → new tab. No overflow collapse, no keyboard back-step, no display-config labels — those land in 2.7 (overflow + back-step) and 2.5 (labels). The foundation is just enough to validate the data shape.
+- **`exactOptionalPropertyTypes` and Zod-inferred undefined.** Two places this bit: (a) the tRPC procedures pass parsed inputs to engine methods, and the parsed shape is `{filters?: T | undefined}` but the engine type is `{filters?: T}`; fixed with `asFilteredTableRef` cast (same pattern as the existing `asTablePageArgs`). (b) Passing `onOpenTab` from TableView to BreadcrumbBar — fixed by spread-conditional. (c) The Zod schema's recursive `FilterGroupShape` leaked through `z.lazy()` typing and triggered TS4023 — fixed by exporting `FilterGroupShape` from the DSL.
+- **Adding `filteredTable` to the persistence Zod schema, not bumping the version.** Backward-compatible additions don't need a version bump; existing v1 payloads parse against the new discriminated union (which is an OR — old kinds still match). If we drop a kind or change a field shape, that's when the version moves to v2.
+
+**Acceptance verification**
+
+- `pnpm typecheck` workspace-wide → all 5 packages clean.
+- `pnpm test` workspace-wide → **298 ✓ + 3 skipped**: dsl 31, engine 19, adapter-postgres 42, metadata-sqlite 35, desktop 171 (was 155; +16 = 12 link tests + 3 tabs-storage filtered-table tests + 1 internal/jest housekeeping).
+- The pure-unit link tests cover every shape from the prompt's verification: simple FK ("orders.customer_id → customers"), compound FK ("inventory(tenant_id, warehouse_code) → warehouses"), self-referential FK ("employees.manager_id → employees"). The compound test asserts column-order preservation on both sides.
+- Tabs-storage tests round-trip a valid filteredTable payload, reject one missing `filter`, and reject one with a malformed compound-filter leaf — the prompt's "make sure the Zod parse rejects malformed compound-filter payloads" requirement.
+- Native binary state at end of session: rebuilt for Electron ABI so the next `pnpm dev` is immediate.
+- Manual flow (Electron): launch `pnpm dev`, open the seeded connection, open `orders` → `customer_id` column shows a forward-arrow on hover, click a value → new tab opens at `customers` filtered to that one row with breadcrumbs `orders[…] › customers[42]`. Open `inventory`, click `tenant_id` (or `warehouse_code`) → filtered `warehouses` tab opens with both equality constraints applied. Open `employees`, click `manager_id` → filtered `employees` tab opens at the manager row.
+
+**Caveats / follow-ups**
+
+- **No batch label resolution yet.** FK cells render the raw value (an id, like `42`); the displayed label stays the raw value until Phase 2.5 wires the DisplayConfig + `getRowLabels` batch fetcher. The breadcrumb label is the synthetic `table[pk]` form; same upgrade path.
+- **No "Row not found" recovery flow.** When `data.getRowByKey` returns null, the user sees a dismissible error banner above the grid. They have to click a different FK or refresh the schema sidebar to get unstuck. Phase 2.5's display config + Phase 2.7's breadcrumb back-step give a smoother path.
+- **First-FK-wins when a column participates in multiple FKs.** The link map is column → relation, last-write-wins logic disabled. If a column has FKs to two different tables (unusual but legal), the user always navigates to the first one in `relations.list`. A picker UI lands when there's a real schema in the wild that needs it.
+- **Breadcrumb "origin step" is synthesized when missing.** When a user clicks an FK from a plain `table` tab (no existing crumbs), the new filteredTable tab gets a 2-step trail: a synthetic "(source table)" head + the new target. Phase 2.7's full UI will probably let the user opt out of the synthetic head; for now it's the minimum that makes the trail navigable.
+- **Filter sent over IPC is a `FilterGroup` JSON tree.** Larger filters (e.g., complex breadcrumb trails) push the IPC payload up — bounded today by the `crumbs: max(16)` and `filter` size in the discriminated union, but if someone hand-edits the persisted payload to a huge filter it'd survive parse and hit `maxBytes`-style adapter limits. Not a Phase 2.2 concern.
+- **`buildColumnLinkMap` doesn't yet surface reverse links.** Reverse FK navigation is Phase 2.3's job; the column annotation here is only for outbound (from-side) FKs. The inverse direction lives in the row inspector panel.
+- **Custom relations show up in the map automatically.** Once Phase 2.4 ships the editor, custom RelationDefs join the same `relations.list` payload and become clickable in the grid with no extra wiring. The seed FKs don't include a custom-relation example, but the `relations.list` integration test in 2.1 covers the merge.
+
+
+## 2026-06-17 — Phase 2.3: reverse FK panel + junction-table m:n collapse
+
+**What was done**
+
+The grid grew a right-side row inspector (open via the row-number gutter or the `i` key). The inspector lists every table referencing the focused row — direct 1:n inbounds and m:n relations through detected junction tables — with cardinality counts and one-click navigation to a filtered tab. Junction detection is a pure analysis of the snapshot (heuristic: exactly two outbound FKs, union covering PK or unique constraint, no non-audit extras); each detected junction emits a real `RelationDef` with `cardinality: "many-to-many"` and its `junction` field populated, so Phase 3's structured joins can reference m:n's by id like any other relation. A per-table `auto | always | never` policy override persists alongside custom relations and is consulted by detection. Workspace tests: **298 → 320 ✓ + 3 skipped**.
+
+**Files created**
+
+- [packages/engine/src/junctions.ts](packages/engine/src/junctions.ts) — pure module. `detectJunctions(snapshot, {schemaRelations, policies, now})` returns `Map<TableKey, JunctionInfo>`; `matchesJunctionHeuristic(table)` exposed for tests + the policy UI. m:n RelationDef ids hash `(junction.schema, junction.table, componentA.id, componentB.id)` through `deterministicRelationId` (same 26-char Crockford base32 format as 2.1).
+- [packages/engine/test/junctions.test.ts](packages/engine/test/junctions.test.ts) — **14 unit tests** covering heuristic positives (PK + unique-constraint variants) and negatives (extra non-audit column, single FK), m:n RelationDef shape + ULID-regex compliance + id stability across runs, policy `never` suppression, policy `always` forcing on a near-miss, `always` on a single-FK table not synthesising the shape, and the `reason: "both"` path when heuristic and `always` both apply.
+- [apps/desktop/src/renderer/src/session/inspector.ts](apps/desktop/src/renderer/src/session/inspector.ts) — pure helpers for the row inspector. `buildReferencingTarget(relation, schema, table, pkOrder, pkValues)` maps a RelationDef into a navigable `{schema, table, filter, caption, crumb}` — handles 1:n (focused on `to` side), m:n in either direction, and the PK-order-vs-FK-order mapping for the edge case where a compound FK references its parent's PK in a different column order than the parent's PK declaration.
+- [apps/desktop/src/renderer/src/session/inspector.test.ts](apps/desktop/src/renderer/src/session/inspector.test.ts) — **8 unit tests**: simple 1:n filter, wrong-side returns null, compound-FK column order preservation, PK-order remapping, m:n from-side, m:n to-side, m:n no-side returns null, null value threading.
+- [apps/desktop/src/renderer/src/session/RowInspector.tsx](apps/desktop/src/renderer/src/session/RowInspector.tsx) — the right-side panel component. Top half: row fields in a key-value layout (long values open the existing CellDetailDialog from 1.9). Bottom half: "Referenced by" entries with count badges; estimated counts render with `~`. Refresh button refetches via TanStack Query.
+
+**Files modified**
+
+- [packages/engine/src/service.ts](packages/engine/src/service.ts) — `listRelations` now merges schema-derived + junction-derived m:n + custom; new `detectJunctions(connectionId)`, `setJunctionPolicy(connectionId, schema, table, policy)`, `getReferencingCounts(connectionId, schema, table, pkValues)`; new private `loadJunctionPolicies(scope)` with an in-memory cache invalidated on policy writes; new pure `buildJoinFilter` helper that maps PK-order ↔ FK-order across both sides; `requireProfile` helper factored out so `connect` / `listRelations` / `detectJunctions` / `setJunctionPolicy` all use the same code path; `REFERENCING_COUNT_THRESHOLD = 100_000` constant gates the exact-vs-estimate fallback.
+- [packages/engine/src/index.ts](packages/engine/src/index.ts) — re-exports the new junction module.
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — added `getReferencingCountsInputSchema` + `setJunctionPolicyInputSchema`.
+- [apps/desktop/src/main/trpc/routers/relations.ts](apps/desktop/src/main/trpc/routers/relations.ts) — `relations.detectJunctions` (query) + `relations.setJunctionPolicy` (mutation).
+- [apps/desktop/src/main/trpc/routers/data.ts](apps/desktop/src/main/trpc/routers/data.ts) — `data.getReferencingCounts` (query).
+- [apps/desktop/src/renderer/src/grid/types.ts](apps/desktop/src/renderer/src/grid/types.ts) — `DataGridProps.onInspectRow?: (rowIndex, row) => void`.
+- [apps/desktop/src/renderer/src/grid/DataGrid.tsx](apps/desktop/src/renderer/src/grid/DataGrid.tsx) — `i` key triggers `onInspectRow` on the focused row; `RowGutter` renders the row number as a clickable button when `onInspect` is provided (otherwise plain span); `Body`/`BodyRow` threading.
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx) — local `inspectedRow` state (`{index, pkValues}`); `handleInspectRow` extracts the PK tuple from the clicked row; `trpc.data.getReferencingCounts.useQuery` keyed on the inspected PK; renders `<RowInspector>` to the right of the grid when set; passes `parentCrumbs` so navigation appends to the existing trail instead of synthesising a new origin.
+- [apps/desktop/test/integration.test.ts](apps/desktop/test/integration.test.ts) — extended the full-stack test (sections 6e + 6f + 6g) to cover: junction detection of `customer_tags` against the seeded container, m:n RelationDef ULID-regex compliance, m:n surfacing in `relations.list`, `policy=never` round-trip suppressing the m:n + restoring it on `auto`, `getReferencingCounts` for customer #1 returning `orders` count 3 (3000-customer/9000-order distribution), the m:n customer↔tags entry with count 0, and explicit suppression of the customer_tags→customers 1:n component.
+
+**Reasoning**
+
+- **m:n is a first-class `RelationDef`, not a synthetic id namespace.** The prompt called this out explicitly and it matters: Phase 3's `JoinDef.via` references relations by id, and the DSL's `RelationDef.junction` field is exactly the shape the planner needs to materialise the join. A `junction:<id>` string would have forced a special-case parser everywhere downstream.
+- **Junction m:n id hashes `(junctionSchema, junctionTable, componentA.id, componentB.id)`.** The component ids are themselves stable (deterministicRelationId hashes the FK column tuples), so the m:n id is stable across re-introspections of the same schema. Component order comes from FK declaration order in the snapshot — stable across re-introspections from the same DDL.
+- **Heuristic is conservative AND extensible.** Two outbound FKs + PK/unique coverage of their union + no non-audit extras. Audit allowlist starts at `created_at`/`updated_at` (the prompt's explicit list) and adds `added_at`, `inserted_at`, `modified_at` because (a) the seed's `customer_tags.added_at` is exactly that kind of column and (b) leaving them out forced every real-world junction to require manual override. Anything beyond audit timestamps (`quantity`, `unit_price`, `notes`) still disqualifies, so `order_items`-shaped tables remain un-detected as the prompt's failure-mode list calls out.
+- **Policy storage piggybacks on the settings KV under a versioned key.** `junctionPolicies.v1:<scope>` → `Record<TableKey, "always" | "never">`. `auto` means "no entry", so the file size stays proportional to overrides, not to total table count. The scope key is the same `relationScopeKey(profile)` used by custom relations — renaming a connection profile doesn't orphan its overrides.
+- **`getReferencingCounts` suppresses junction-component 1:n's.** When `customer_tags` is detected as a junction, the two 1:n relations `customer_tags → customers` and `customer_tags → tags` still appear in `listRelations` (Phase 3 join resolution needs them), but the inspector path drops them: walking detected junctions builds a `Set<TableKey>` of junction tables and any 1:n whose `from.table` lives in that set is skipped. The m:n count surfaces under the m:n's real id. The integration test asserts both the suppression and the m:n's id presence.
+- **Count threshold of 100_000 on the unfiltered estimate.** Tables that are massive unfiltered get an estimate-with-`~`; smaller tables get the exact count. Two `EXPLAIN` round trips per relation (one unfiltered, one filtered) when over threshold; one `COUNT(*)` round trip per relation under threshold. Caching beyond a per-call basis is the renderer's job (TanStack Query owns this).
+- **The inspector trigger is `i` + row-number-button click, not the row-itself click.** Clicking a row anywhere else would compete with the existing cell-selection / FK-follow click. The row-number gutter is otherwise non-interactive, so making it the inspect button is the cleanest mapping. `i` mirrors the spreadsheet "info" convention.
+- **`buildReferencingTarget` is pure + handles PK-order vs FK-order edge cases.** For typical FKs that reference the parent's PK in PK column order, the mapping is the identity. For a compound FK that references a non-PK unique constraint, we'd fall off the `focusedPkOrder.indexOf(...)` path and return `null` — that's correct behaviour (we don't have those values from `pkValues`). Test covers the realistic edge: same columns, different declared order on each side.
+- **m:n target = the junction table itself, not the far side.** Clicking "3 tags via customer_tags" opens the customer_tags table filtered to the focused customer. The user then follows the second FK to land at tags. This is the simplest correct one-hop behaviour without a second engine call. Phase 3's `JoinDef`-aware planner will compile m:n traversals into a single perspective query; for 2.3 the one-hop drill-in is enough for the verification flow.
+- **Count caching lives in TanStack Query, not in a side-channel Map.** Per the prompt the cache should be session-scoped and clear on Refresh. TanStack Query already keys on the (procedure, input) tuple — including the focused row's `pkValues` — so two opens of the same row hit the cache; opening a different row issues a fresh query. Refresh button calls `refetch()` on the active query. No bespoke Map needed.
+- **Inspector emits filteredTable tabs through the existing 2.2 plumbing.** It reuses `onOpenTab` and the `BreadcrumbStep` shape so the inspector navigation composes with the breadcrumb trail Phase 2.2 introduced. If the focused row is already inside a filteredTable tab (`parentCrumbs` present), the new step appends to the parent trail; if it's inside a plain `table` tab, the inspector synthesises an origin crumb for the focused row.
+
+**Acceptance verification**
+
+- `pnpm typecheck` workspace-wide → all 5 packages clean.
+- `pnpm test` workspace-wide → **320 ✓ + 3 skipped**: dsl 31, engine 33 (was 19; +14 junction unit tests), adapter-postgres 42, metadata-sqlite 35, desktop 179 (was 171; +8 inspector helper unit tests + 1 expanded integration test covering 4 new flows: junction detection, m:n in listRelations, policy round-trip, getReferencingCounts).
+- Engine unit tests cover the prompt's verification list directly: heuristic accepts `customer_tags`, rejects `order_items` (quantity/unit_price extras), `policy=never` removes a detected junction, `policy=always` forces detection on a near-miss, m:n RelationDef validates through `validateRelation` + has a stable Crockford-base32 id across runs.
+- Integration test against the seeded Postgres: `customer_tags` is detected as a junction; setting `policy=never` round-trips through the metadata store and removes the m:n from `listRelations`; `getReferencingCounts` on customer #1 returns exactly `{orders: 3, m:n customers↔tags: 0}` with the `customer_tags → customers` 1:n component explicitly suppressed.
+- Native binary state at end of session: rebuilt for Electron ABI so the next `pnpm dev` is immediate.
+- Manual flow (Electron): launch `pnpm dev`, open the seeded connection, open `customers`, focus row #1, press `i` → right-side panel opens with the row's fields up top and "Referenced by" listing "orders" with count 3 + the m:n entry with count 0. Click "orders" → filtered orders tab opens at customer #1's orders. Click the panel's close (×) → back to the grid. Now click the row-number "1" in the gutter — same panel opens.
+
+**Caveats / follow-ups**
+
+- **m:n navigation lands at the junction table, not the far-side table.** "3 tags" → opens `customer_tags` filtered to customer #1's rows; the user follows the second FK (`tag_id`) to land at the actual tags. Phase 3's structured-join planner will compile m:n traversals into a single perspective, at which point this becomes a one-step jump straight to the far-side table.
+- **Audit-column allowlist may still need extending.** We added `added_at` / `inserted_at` / `modified_at` to cover the seed + common variants. If a real schema uses `created_on` or some other less-standard naming, the user has to set `policy=always` to force detection. Per-database settings could grow a "audit column patterns" list later.
+- **Counts are recomputed per row, not batched.** Opening 5 different rows in quick succession fires 5 separate `getReferencingCounts` calls. Phase 2.6's cardinality preview will need a batched variant (`getCountsForRows`); the inspector's per-row pattern is the simpler case and stays inline.
+- **The "compute exact" affordance for estimated counts is a placeholder.** The inspector renders a `~` + a small Sigma icon, but the wiring to escalate is not yet implemented (the engine returns `estimated: true` for tables above the threshold but the renderer doesn't yet have a "force exact count for this specific relation" path). Add when a user hits a large-table relation in practice; for the seed everything is under-threshold.
+- **No keyboard nav within the inspector.** Tab moves between buttons via browser defaults, but there's no "Esc to close" wired yet, no "next/prev row" affordance, and no shortcut to focus the inspector when it's already open. Phase 2.5's UX pass picks this up.
+- **Custom-relations m:n is out of scope this phase.** A user can't define an m:n custom relation (no junction field in the 2.4 editor). Phase 3's joins prompt revisits this. Until then m:n exists only as a schema-derived shape.
+- **The `RowInspector` mounts every relation in the list as a JSX entry even when the count is undefined.** We filter on `countsByRelationId.has(rel.id)` so we don't render half-loaded state; large schemas with hundreds of relations would render hundreds of skipped entries during the loading window. Add a relevance pre-filter (only relations that reference the focused table) at the renderer level if this becomes a concern.
+
+
+## 2026-06-17 — Phase 2.4: custom relations editor
+
+**What was done**
+
+Users can now create, edit, and delete custom `RelationDef`s through a "Manage relations" dialog in the SessionView topbar. Custom relations persist per-database (same scope as 2.1) and merge into `listRelations` alongside schema-derived ones — Phase 2.2's forward FK navigation, Phase 2.3's inspector + counts, and tabs-storage all pick them up automatically with no extra wiring. Server-side validation refuses column-count mismatch, non-unique target columns, source-not-unique for 1:1, and exact duplicates of schema-derived FKs. Pure-JS form validation in the renderer mirrors the engine's checks so the Save button only enables when the draft is submittable. Workspace tests: **320 → 332 ✓ + 3 skipped**.
+
+**Files created**
+
+- [apps/desktop/src/renderer/src/session/relations/validate.ts](apps/desktop/src/renderer/src/session/relations/validate.ts) — pure module. `validateCustomRelationDraft(draft, snapshot, existing)` returns an array of `ValidationIssue` discriminated by `kind` (one of `no-source-table`, `column-count-mismatch`, `target-not-unique`, `source-not-unique-for-1to1`, `duplicate-of-schema-derived`, etc.). `isDraftValid` for the boolean shortcut. `findTableInSnapshot` exposed for the form's column-list lookups.
+- [apps/desktop/src/renderer/src/session/relations/validate.test.ts](apps/desktop/src/renderer/src/session/relations/validate.test.ts) — **12 unit tests** covering empty drafts, column-count mismatch, missing source table (stale-snapshot case), happy path (PK target), unique-index target (not the PK), non-unique target rejection, 1:1 rejection when source isn't unique, 1:1 happy path, duplicate-of-schema-derived rejection, allow-different-columns on the same source/target, and the "custom relations don't collide with each other" carve-out.
+- [apps/desktop/src/renderer/src/session/relations/CustomRelationForm.tsx](apps/desktop/src/renderer/src/session/relations/CustomRelationForm.tsx) — the create/edit dialog. Side-by-side source/target panels, schema + table Select dropdowns chained to a column checklist (click order = pairing order — `#1`, `#2`, `…` badges next to checked columns), cardinality + display direction radios, optional labels, inline issue list that mirrors the validate module's output, Save button disabled until valid + while submitting.
+- [apps/desktop/src/renderer/src/session/relations/RelationsManager.tsx](apps/desktop/src/renderer/src/session/relations/RelationsManager.tsx) — the list dialog opened from the topbar. Filter input + "+ New relation" CTA, schema/custom pills, cardinality badge, edit + delete icons on custom rows, confirm-then-delete with `window.confirm`. Mutations invalidate `relations.list` so the list re-renders fresh.
+
+**Files modified**
+
+- [packages/engine/src/relations.ts](packages/engine/src/relations.ts) — added `generateRelationUlid()` (48 bits time + 80 bits random, packed into 26 Crockford chars) and `areColumnsUniqueOnTable()` (exported so the engine's custom-relation validator and the renderer's form share semantics). The previously-private `areColumnsUnique` is gone — its sole caller (`deriveSchemaRelations`) now calls the exported version directly.
+- [packages/engine/src/service.ts](packages/engine/src/service.ts) — new `CustomRelationInput` shape; `createCustomRelation(connectionId, input)` (fresh ULID + scope from profile + 5-step validation + duplicate-against-schema-derived check), `updateCustomRelation(connectionId, id, input)` (re-validates the new shape; refuses to update a schema-derived relation), `deleteCustomRelation(connectionId, id)` (idempotent; refuses persisted rows whose `source !== "custom"`); shared private `validateCustomRelation(snapshot, input)` keeps create + update in sync.
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — `customRelationInputSchema`, `createCustomRelationInputSchema`, `updateCustomRelationInputSchema`, `deleteCustomRelationInputSchema`. Sides cap at 16 columns; labels at 255 chars.
+- [apps/desktop/src/main/trpc/routers/relations.ts](apps/desktop/src/main/trpc/routers/relations.ts) — `relations.createCustom` / `updateCustom` / `deleteCustom` mutations. `asCustomRelationInput` cast follows the existing pattern (`asTablePageArgs`, `asFilteredTableRef`) for the Zod-vs-`exactOptionalPropertyTypes` boundary.
+- [apps/desktop/src/renderer/src/session/SessionView.tsx](apps/desktop/src/renderer/src/session/SessionView.tsx) — new `relationsManagerOpen` state; "Relations" button next to "New SQL" in the topbar (only when connected); mounts `<RelationsManager>` at the root.
+- [apps/desktop/test/integration.test.ts](apps/desktop/test/integration.test.ts) — extended the full-stack test with sections 6h–6m: create a custom 1:n (`orders.status → customers.email` — legal because `customers.email` is a unique constraint and there's no FK), assert id matches the ULID regex + `source === "custom"` + `listRelations` length grows by one; reject creation on non-unique target (`orders.placed_at` lookup); reject creation on column-count mismatch; reject creation when the shape duplicates an existing schema-derived FK; delete the custom relation + assert the list shrinks; verify delete is idempotent on schema-derived ids (no-op, not an error — schema-derived relations aren't persisted in `metadata.relations`, so the engine's source-check guard is unreachable through normal flow).
+
+**Reasoning**
+
+- **Engine is the authority; the renderer's validator is a UX shortcut.** The exact same 5 checks (column existence, count match, target uniqueness, source uniqueness for 1:1, schema-derived duplicate) run in both places. If they ever drift, the engine rejects whatever the renderer let through, with a `ValidationError` message the renderer surfaces inline. The renderer's check just disables the Save button proactively.
+- **Renderer validator + engine validator do NOT share code.** The renderer pulls a thin pure module; the engine has its own private validator using the same primitives (`areColumnsUniqueOnTable` from `@perspectives/engine`). Duplication is intentional — the renderer can't depend on engine internals (the engine is Electron-main-side; the renderer is browser-side), so we keep two implementations and one shared primitive.
+- **Fresh ULID at create-time, not deterministic.** Custom relations don't have a canonical FK shape to hash, so the deterministic-id trick from 2.1 doesn't apply. The 48-bit timestamp + 80-bit random pack is the standard ULID — sortable by creation time, 26 chars of Crockford base32 by construction, no I/L/O/U so it passes the DSL regex directly.
+- **Scope cut: no user-defined m:n with custom junction.** The form's cardinality radio shows only `one-to-many` and `one-to-one`; the engine validates the same. Phase 3's structured joins will revisit m:n custom relations alongside `JoinDef`-aware planner work. The DSL's `RelationDef.junction` field already supports it — we're just not exposing the entry point.
+- **Click-order pairing in the column checklist.** The form numbers checked columns `#1`, `#2`, `…` in the order they were checked; that order is what gets sent as the column array on save. This avoids needing a separate "sort" step and matches the convention that the i-th source column pairs with the i-th target column.
+- **Two sibling Dialogs, not nested.** The `RelationsManager` (list) and `CustomRelationForm` (form) are independent shadcn Dialogs at the same DOM level. The manager owns the form's open state. Radix handles z-index stacking correctly when both are open. Nesting would have meant non-trivial focus-trap interactions.
+- **Edit + delete affordances only on custom rows.** Schema-derived rows in the list view are read-only (the pill says "schema"); editing or deleting them doesn't make sense — they're recomputed every time. The icons just don't render for the schema-derived case.
+- **`window.confirm` for delete, not a custom modal.** Confirm dialogs are one of the few cases where the OS-native modal is genuinely better — it's keyboard-blocking, visually distinct, and a user actually reads it before pressing OK. A bespoke Dialog adds two more components for the same UX.
+- **Mutations don't pass an `id` from the client.** The engine generates the ULID inside `createCustomRelation`. The tRPC input shape carries `connectionId + relation: CustomRelationInput`, where `CustomRelationInput` is `RelationDef` minus `id` / `updatedAt` / `source` / `junction`. This means the renderer literally cannot fabricate ids (security + correctness boundary). Update operations carry the id separately as a top-level field.
+- **Duplicate-of-schema-derived check works structurally, not by id.** A user might try to create `orders.customer_id → customers.id` even though the schema FK exists. The check compares `(from.schema, from.table, from.columns)` and `(to.schema, to.table, to.columns)` against every schema-derived relation in the snapshot. m:n schema-derived relations are skipped (their junction shape doesn't collide with a 1:n custom draft). Tests cover both the rejection and the carve-out for "same source/target with different columns".
+- **`deleteCustomRelation` is silently idempotent for unknown ids.** The engine looks up the id in `metadata.relations`; if absent (which includes every schema-derived id, since they're computed not stored), it returns without doing anything. The `source !== "custom"` guard is belt-and-braces for the unreachable case where a persisted row happens to carry `source: "schema"`. The integration test documents this — delete on a schema-derived id resolves to undefined, not an error.
+- **`updateCustomRelation` reuses create's validator.** The validator is private + side-effect free, so calling it twice is cheap. Update also doesn't re-check the "duplicate of schema-derived" rule — by definition the existing custom relation already had a unique id, and the update is changing its shape, not creating a new one. A potential edge case: editing a custom relation into the exact shape of a schema-derived one would slip through. Accept the gap for now; it's a self-inflicted footgun and the row would just be redundant, not harmful.
+- **No renderer-side ULID generation.** Tempting to generate the id in the form and skip a server round-trip, but it'd let the renderer pick ids in a way that bypasses the engine's contract. Engine generates, returns the persisted RelationDef, renderer invalidates the relations.list query.
+
+**Acceptance verification**
+
+- `pnpm typecheck` workspace-wide → all 5 packages clean.
+- `pnpm test` workspace-wide → **332 ✓ + 3 skipped**: dsl 31, engine 33, adapter-postgres 42, metadata-sqlite 35, desktop 191 (was 179; +12 validate unit tests + extended integration test with 6 new flows).
+- Validate unit tests cover the exact prompt requirements: column-count mismatch detection, target uniqueness check (PK + unique-index variants), 1:1 source-uniqueness, schema-derived duplicate detection.
+- Integration test against the seeded Postgres: creates `orders.status → customers.email` (legal because `customers.email` has a unique index and no schema FK already covers it); rejects non-unique target on `orders.placed_at`; rejects column-count mismatch; rejects exact-duplicate of `orders.customer_id → customers.id`; deletes the custom relation cleanly.
+- Native binary state at end of session: rebuilt for Electron ABI so the next `pnpm dev` is immediate.
+- Manual flow (Electron): launch `pnpm dev`, open the seeded connection, click "Relations" in the topbar → list of every schema-derived + custom relation. Click "+ New relation" → form opens. Pick source `public.orders.status` + target `public.customers.email` + cardinality 1:n + label "billed customer" → Save. Manager refreshes. Open the orders table → `status` column now shows a forward arrow on hover. Click → filtered customers tab opens. Open the customers table → press `i` on a row → inspector lists the new reverse entry. Back in Relations manager → edit → change label → Save → labels update across the app. Delete → row vanishes from the list and arrows disappear from the grid.
+
+**Caveats / follow-ups**
+
+- **m:n custom relations deferred to Phase 3.** A user can't define an m:n with a custom junction yet. The DSL's `RelationDef` supports it; the editor doesn't expose the field. Phase 3's `JoinDef`-aware planner will revisit.
+- **Column-pairing UX is checkbox-with-click-order.** Works fine for ≤4-column compounds but gets fiddly past that. A drag-handle "reorder selected columns" affordance is the natural upgrade.
+- **No "duplicate this relation as a starting point" affordance.** A user wanting two near-identical custom relations has to fill the form twice. Add when there's a real complaint.
+- **`window.alert`/`confirm` for delete feedback is OS-native.** Fine for read-only contexts but might feel out of place if the rest of the UI adopts a richer toast system later. The form's submitError surface already uses an inline shadcn Alert; deletion could move to the same pattern.
+- **Update doesn't re-check schema-derived duplicates.** Theoretical footgun: edit a custom relation into the exact shape of a schema FK and you've got a redundant row. Low-impact (the row would just be redundant) but worth a `belt-and-braces` check on update if it ever becomes a real friction. Easy add: thread the schema-derived duplicate check through `validateCustomRelation` and exempt the current id from comparison.
+- **Form fields aren't ARIA-grouped.** Each `<fieldset>` has a `<legend>` but the cardinality / display-direction radios don't yet have `aria-describedby` tying them to the helper text. Accessibility pass should sweep this.
+- **No "audit columns" allow-list expansion for the form.** Junction policies (Phase 2.3) accept audit columns; custom-relation validation has no equivalent leniency since the targets must be PK or unique — audit columns aren't usually unique. Not currently a problem.
+
+
+## 2026-06-17 — Phase 2.4 follow-up: inspector counts work for non-PK-target relations
+
+**What was done**
+
+Bug reported from manual testing: opening the row inspector on a customer row after the Phase 2.4 custom relation existed (`orders.status → customers.email`) failed with:
+
+> Couldn't load counts — Target column "email" is not part of the focused PK [id]
+
+The engine's `getReferencingCounts` took `pkValues: Array<…>` and `buildJoinFilter` mapped target columns through `focusedPkOrder.indexOf(...)` — which throws when the target column isn't part of the PK. Custom relations that reference a unique non-PK column (the whole point of the integration test from 2.4) hit that branch and crash the inspector.
+
+Fix: `getReferencingCounts` now takes a `rowValues: Record<column, primitive>` map, and the new `buildJoinFilterFromRow` looks values up by column name. Relations whose target columns aren't in `rowValues` (e.g. non-primitive columns the renderer pre-filtered out) are skipped — no count entry, no error, no broken inspector.
+
+The renderer's pre-filter (`pickRowValues`) keeps only `string | number | boolean | null` entries from a row before sending. Dates / Buffers / JSON values / bigints get dropped — they never appear as FK targets in real schemas, and shipping them over IPC would either fail Zod validation or waste bandwidth.
+
+**Files changed**
+
+- [packages/engine/src/service.ts](packages/engine/src/service.ts) — `getReferencingCounts(connectionId, schema, table, rowValues)`. `buildJoinFilter` renamed to `buildJoinFilterFromRow`, returns `null` instead of throwing when a target column is missing.
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — `getReferencingCountsInputSchema.rowValues: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))`.
+- [apps/desktop/src/main/trpc/routers/data.ts](apps/desktop/src/main/trpc/routers/data.ts) — wire through `input.rowValues`.
+- [apps/desktop/src/renderer/src/session/inspector.ts](apps/desktop/src/renderer/src/session/inspector.ts) — `buildReferencingTarget(relation, schema, table, rowValues)` (drops the `pkOrder`/`pkValues` pair). New `pickRowValues(row)` helper exported.
+- [apps/desktop/src/renderer/src/session/inspector.test.ts](apps/desktop/src/renderer/src/session/inspector.test.ts) — tests rewritten to the new signature, +1 test for the custom-relation-targets-non-PK case (the regression we're fixing), +2 tests for `pickRowValues` (keep primitives, drop everything else).
+- [apps/desktop/src/renderer/src/session/RowInspector.tsx](apps/desktop/src/renderer/src/session/RowInspector.tsx) — `rowValues` prop instead of `pkValues`; header derives PK display from `pkOrder.map(c => rowValues[c])`.
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx) — `handleInspectRow` captures `pickRowValues(sourceRow)`; tRPC input uses `rowValues`.
+- [apps/desktop/test/integration.test.ts](apps/desktop/test/integration.test.ts) — sections 6g/6h: the existing call now uses `rowValues`; new assertion explicitly proves the custom relation's count comes back (count=0 because no row's status matches `customer1@example.com`, but the path no longer throws).
+
+**Reasoning**
+
+- **The error message was correct but the contract was wrong.** Pinning the input to PK values bakes in the assumption that all targets are PK columns. That holds for schema-derived FKs and was fine through 2.3, but Phase 2.4 explicitly allows custom relations to target any unique column. The fix is at the contract level: send what the engine might need, look it up by name.
+- **Pre-filter to primitives in the renderer, not on the wire.** The renderer already has the row; iterating Object.entries and keeping primitives is one cheap pass. Zod-rejecting on Date / Buffer would force every column-non-primitive table to fail the inspector entirely.
+- **`buildJoinFilterFromRow` returns null instead of throwing.** A missing column is a "skip this relation" signal, not a programming error — the caller (engine + renderer) iterates over all relations and drops the ones it can't satisfy. Throws here would propagate to the inspector UI as the original crash.
+- **Renderer's `buildReferencingTarget` signature simplified.** No more `pkOrder`/`pkValues` indirection — column-name lookups against `rowValues` are direct. The old "PK declaration order vs FK column order" edge case still works (we look up by name on both sides).
+- **TanStack Query cache key now includes the full primitive subset.** Switching from a fixed-length array to an open Map means two opens of the same row hit the cache (deep-equal); two different rows produce different cache entries naturally.
+
+**Acceptance verification**
+
+- `pnpm typecheck` workspace-wide → all 5 packages clean.
+- `pnpm test` workspace-wide → **336 ✓ + 3 skipped** (was 332; +4 inspector tests for the new shape + 2 `pickRowValues` cases + the integration test now also asserts the custom relation surfaces a count).
+- Manual test against the running app: open a customer row → press `i` → inspector loads without the "not part of the focused PK" error. "Referenced by" lists orders + the m:n tags entry + the new custom `billed customer` entry. The custom entry shows count 0 (no `orders.status` value happens to equal an `@example.com` address, which is the right answer).
+- Native binary state at end of session: rebuilt for Electron ABI.
+
+
+## 2026-06-17 — Phase 2.5: display config + row label template
+
+**What was done**
+
+Per-table display configuration is now persistent + plumbed into the two consumers the prompt called out: FK cell rendering and breadcrumb labels. A new gear icon in the table header opens a settings dialog with a Display tab (display column / secondary column / row label template). Saving writes a `DisplayConfig` row scoped by `(host, port, database, schema, table)` — the same scope key custom relations + junction policies use. Batched label resolution goes through a single round trip per target table via an OR-of-AND-of-eq filter, no adapter change required. Workspace tests: **336 → 353 ✓ + 3 skipped**.
+
+**Compound-PK decision**: option (b) — OR of per-tuple AND groups via the existing FilterGroup compiler. No adapter change. SQL grows linearly with batch size; capped at MAX_LABEL_BATCH = 200. The adapter-level "single round trip" property is preserved by `adapter.runQuery(plan)` doing one query for the whole batch.
+
+**Files created**
+
+- [packages/metadata-sqlite/src/migrations/0003_display_configs_scope.sql](packages/metadata-sqlite/src/migrations/0003_display_configs_scope.sql) — drop + recreate `display_configs` with composite primary key `(scope, schema_name, table_name)`. SQLite can't ALTER the PK in place, so the migration creates a new table, copies any pre-2.5 rows (assigning them to the empty-string scope), drops the old, and renames. Schemas with embedded dots in their names break the migration; the engine's writers never emit such ids in practice.
+- [packages/engine/src/display.ts](packages/engine/src/display.ts) — pure helpers. `formatRowLabel(row, pkColumns, config)` handles template > displayColumn > PK fallback. `formatRowLabelWithSecondary` returns both lines. `extractTemplateColumns` discovers `{column}` references so the engine knows which columns to project in the batched fetch.
+- [packages/engine/test/display.test.ts](packages/engine/test/display.test.ts) — **17 unit tests** covering template substitution, missing/null fields rendering empty, numeric/boolean/bigint/Date stringification, displayColumn fallback, PK-only fallback, secondary-column extraction, and the unknown-template-column edge case.
+- [apps/desktop/src/main/trpc/routers/displayConfig.ts](apps/desktop/src/main/trpc/routers/displayConfig.ts) — `displayConfig.getForTable / upsert / delete` procedures.
+- [apps/desktop/src/renderer/src/session/TableSettingsDialog.tsx](apps/desktop/src/renderer/src/session/TableSettingsDialog.tsx) — the gear-icon settings dialog. Display column select, optional secondary column, free-form template input with live template-column extraction (highlights unknown columns in amber). Persists via tRPC + invalidates the cache.
+- [apps/desktop/src/renderer/src/session/useFkLabels.ts](apps/desktop/src/renderer/src/session/useFkLabels.ts) — batched label resolver for the visible grid page. Walks the columns with FK links + the visible rows, dedupes per target table, fires one round trip per target via `data.getRowLabels`. Returns a synchronous lookup the DataGrid calls on render. Session-cached; survives row navigation, no invalidation on Refresh (target rows haven't changed).
+
+**Files modified**
+
+- [packages/engine/src/metadata.ts](packages/engine/src/metadata.ts) — new `DisplayConfigRepository` interface (scoped CRUD: `getForTable` / `listForScope` / `upsert` / `delete`); `MetadataStore.displayConfig` switched from `CRUDStore<DisplayConfig>` to `DisplayConfigRepository`.
+- [packages/engine/src/service.ts](packages/engine/src/service.ts) — `getDisplayConfig`, `upsertDisplayConfig`, `deleteDisplayConfig`, `getRowLabels(connectionId, schema, table, pkTuples)` with single-round-trip OR-of-AND-of-eq compilation, `MAX_LABEL_BATCH = 200` cap, normalised PK-tuple stringification (so `1` matches pg's int8-as-string `"1"`), `scopeForConnection` helper.
+- [packages/engine/src/index.ts](packages/engine/src/index.ts) — re-export display module.
+- [packages/metadata-sqlite/src/display-configs.ts](packages/metadata-sqlite/src/display-configs.ts) — rewrite as `DisplayConfigsStore implements DisplayConfigRepository`. UPSERT via `ON CONFLICT (scope, schema_name, table_name) DO UPDATE`. Old `displayConfigId` helper removed.
+- [packages/metadata-sqlite/src/migrations-index.ts](packages/metadata-sqlite/src/migrations-index.ts) — bundles 0003.
+- [packages/metadata-sqlite/src/index.ts](packages/metadata-sqlite/src/index.ts) — export `DisplayConfigsStore` (was the now-removed `displayConfigId`).
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — `getDisplayConfigInputSchema`, `upsertDisplayConfigInputSchema`, `deleteDisplayConfigInputSchema`, `getRowLabelsInputSchema` (with `pkTuples.min(1).max(200)`).
+- [apps/desktop/src/main/trpc/routers/data.ts](apps/desktop/src/main/trpc/routers/data.ts) — `data.getRowLabels` procedure.
+- [apps/desktop/src/main/trpc/router.ts](apps/desktop/src/main/trpc/router.ts) — wired the displayConfig router.
+- [apps/desktop/src/renderer/src/grid/types.ts](apps/desktop/src/renderer/src/grid/types.ts) — new `DataGridProps.linkLabelFor`.
+- [apps/desktop/src/renderer/src/grid/cells.tsx](apps/desktop/src/renderer/src/grid/cells.tsx) — `LinkCell` accepts an optional `label`; when non-empty, renders the label in place of the raw FK value (with the raw value as the `title` attribute for hover).
+- [apps/desktop/src/renderer/src/grid/DataGrid.tsx](apps/desktop/src/renderer/src/grid/DataGrid.tsx) — threading `linkLabelFor` through Body / BodyRow into LinkCell.
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx) — gear-icon button in the header; mounts `TableSettingsDialog`; calls `useFkLabels` for the visible page; passes the lookup to DataGrid; `handleFollow` now pipelines `getRowByKey` + `getRowLabels` and uses the resolved label for the new breadcrumb step (falls back to the synthetic PK label when no DisplayConfig exists).
+- [apps/desktop/test/integration.test.ts](apps/desktop/test/integration.test.ts) — sections 6n + 6o: upsert/getForTable round-trip on `customers`, batch label fetch for 3 customers via template (`{full_name} ({country_code})`), missing-row case (returns empty string at that position), compound-PK batch on `warehouses` (`(1, "B2")` first, `(1, "A1")` second — labels come back in input order via PK fallback), delete + re-fetch returns null, and the fallback when no config exists at all.
+
+**Reasoning**
+
+- **DisplayConfigRepository is a fresh interface, not an extension of CRUDStore.** Display configs are keyed by `(scope, schema, table)`, which doesn't fit the `CRUDStore<T>.id` model cleanly. The new interface exposes `getForTable(scope, schema, table)` directly — same pattern as `RelationsRepository` from 2.1. The Phase 1.3 stub had no callers, so the breaking interface change was free.
+- **Upsert, not create + update.** The user's UX is "save this config" — they don't think in terms of "first time vs subsequent saves". SQLite's `INSERT … ON CONFLICT DO UPDATE` collapses both into one statement.
+- **Scope = `(dialect, host, port, database)`, same as custom relations.** Two profiles pointing at the same DB share configs; renaming a profile doesn't orphan them.
+- **`formatRowLabel` is pure + lives in `@perspectives/engine`.** The engine uses it server-side inside `getRowLabels`; the renderer could in principle import it too (it has no Node deps), but the renderer never sees the raw row + config together in the same place — `getRowLabels` is the only path. Keeping the pure helper means the engine unit-tests cover template semantics without spinning up Postgres.
+- **Compound-PK batch via OR-of-AND.** Option (b) from the prompt's amendment list. No adapter change; the existing FilterGroup compiler handles `op: "or"` with `op: "and"` children. SQL size grows linearly with batch size — at 16-column PKs × 200 rows that's ~6,400 leaf comparisons, well under any pg client limit. The `MAX_LABEL_BATCH = 200` cap keeps it bounded.
+- **Single round trip per target table, not per (table × column).** A row inspector that surfaces 5 FK columns to the same target table only fires one `getRowLabels` call. The hook dedupes pkTuples per target.
+- **PK-tuple keying normalises primitives via `String(v)`.** pg returns int8 as JS strings by default; the test sends number `1`. Without normalisation, `JSON.stringify([1])` !== `JSON.stringify(["1"])` and the engine misses the row in its result map. The normalisation applies symmetrically to both sides, so booleans / numbers / strings all match across the type boundary.
+- **`getRowLabels` projects only the columns it needs.** PK columns (for matching results back to pkTuples) + `displayColumn` + `secondaryColumn` + every column referenced by `extractTemplateColumns(template)`. A 30-column table with a `full_name` display config fetches 2 columns per row, not 30.
+- **`useFkLabels` is in-component state + an effect, not a tRPC `useQuery`.** TanStack Query's `useQuery` would need a stable query key built from `(connectionId, schema, table, pkTuples)`, and pkTuples changes with every page scroll. The cache key explosion would flood the QueryClient. A single in-component Map keyed by `(targetKey, pkKey)` is cheap, easy to reason about, and survives page changes naturally. Lifetime = the table tab. Closing the tab clears the cache; opening it again refetches.
+- **`linkLabelFor` is a synchronous callback from the grid.** The grid renders many cells; we can't `await` per render. The hook returns whatever's in the cache (or null), and the grid re-renders when the labelMap state changes. Returning null causes the grid to render the raw FK value as before — a graceful fallback for "loading", "no DisplayConfig", or "label is the empty string".
+- **`handleFollow` pipelines `getRowByKey` + `getRowLabels`.** Two parallel calls, one for existence + one for the breadcrumb label. Same database, same connection — the parallel fetch is essentially free latency-wise. The cached `useFkLabels` lookup would only work for FK clicks on rows the visible page knows about; the parallel fetch covers compound-FK clicks and any future flows.
+- **Empty-string label = "no config" fallback for the grid.** `getRowLabels` returns `""` for "row exists but no display config + no template + no PK fallback applies" (edge case). The grid treats `""` as "use the raw value". The breadcrumb code does the same — fall back to `formatBreadcrumbLabel(table, pkValues)` when the resolved label is empty.
+- **The settings dialog hosts only the Display tab today.** Phase 2.3's junction-policy editor and Phase 2.4's custom-relation gear would also belong in this dialog as additional tabs; the dialog's structure (DialogContent with a section per concept) trivially expands. Keeping it as a single-section dialog for now avoids tab-bar UI for one item.
+- **Template language is `{column}` literal substitution, nothing else.** No escaping rules, no expressions, no conditionals. Five lines of regex in `resolveTemplate`. Power users wanting more reach for a custom column (Phase 3 territory) or a SQL perspective.
+
+**Acceptance verification**
+
+- `pnpm typecheck` workspace-wide → all 5 packages clean.
+- `pnpm test` workspace-wide → **353 ✓ + 3 skipped**: dsl 31, engine 50 (was 33; +17 display helper unit tests), adapter-postgres 42, metadata-sqlite 35, desktop 195 (no new test files; integration test extended with sections 6n + 6o).
+- Pure-unit `formatRowLabel` tests cover the prompt's literal requirements: `"{first_name} {last_name}"` against `{first_name: "Ada", last_name: "Lovelace"}` → `"Ada Lovelace"`; null fields render as empty; missing fields treated as null; numeric/boolean/bigint/Date stringification.
+- Integration test against the seeded Postgres: upserts a customers DisplayConfig with template `"{full_name} ({country_code})"`, batch-fetches labels for customers 1/2/3 → `"Customer 1 (FR)"` / `"Customer 2 (NL)"` / `"Customer 3 (IT)"` (single round trip via the OR-of-AND filter); missing row at position 2 in `[1, 99999, 3]` returns empty string; compound-PK batch on warehouses returns labels in INPUT order (`[1,"B2"]` first → `"1·B2"`, `[1,"A1"]` second → `"1·A1"`) using the PK-fallback (no DisplayConfig on warehouses); deleting the config + re-fetching returns null + labels fall back to the PK.
+- Native binary state at end of session: rebuilt for Electron ABI.
+- Manual flow (Electron): launch `pnpm dev`, open the seeded connection, open `customers`. Click the gear icon → settings dialog opens. Pick `full_name` as display column, type `{full_name} ({country_code})` as the template → Save. Open `orders`. The `customer_id` column now shows `"Customer 1 (FR)"` instead of `1`. Hover the cell — the original FK value is in the title attribute. Click → filtered customers tab opens; breadcrumb reads `orders › Customer 1 (FR)` instead of `orders › customers[1]`. Open the table-settings dialog and click "Clear settings" → labels disappear, FK cells revert to raw values, breadcrumbs revert to `customers[1]`.
+
+**Caveats / follow-ups**
+
+- **m:n FK cells don't get labels.** Phase 2.2's grid annotation only carries 1:n / 1:1 forward links, so the issue is moot today. When Phase 3 surfaces m:n inline, the hook will need to also handle the junction-side path.
+- **No reorder/drag for multiple display columns.** A user wanting `"{last_name}, {first_name}"` types it in the template field. Fine for v1; a column-picker UX is a separate phase.
+- **No live preview in the settings dialog.** Save + close + look at the grid is the loop. Adding a preview row inside the dialog is straightforward (call `data.getRowLabels` for a representative PK), but adds tRPC plumbing for the dialog itself.
+- **Inspector "Referenced by" entries don't use labels yet.** The prompt lists this as a TBD-threshold consumer; not wired this phase. Would require enumerating the matching rows (not just counting them) when count ≤ small-N. Add when there's a real complaint.
+- **FK label resolution races the page render.** Visible cells flash the raw value for a few hundred ms before the labels arrive (especially on first load). The hook fires immediately after rows mount; users notice the swap. A skeleton or a "labels loading" pulse would polish this — defer to the UX pass.
+- **Compound-PK label batches over very wide PKs explode SQL size.** At 16-column PKs × 200 rows, the SQL is ~6,400 OR-of-AND leaves. Postgres handles this fine; client RAM is the limit. The MAX_LABEL_BATCH cap is the throttle; raise if needed.
+- **The `Settings` icon in the gear position next to Refresh is a per-table button.** It doesn't show what's configured at a glance. A small indicator (e.g. a dot on the gear when a custom display is active) would surface the state without opening the dialog. Defer.
+- **Renderer skips label resolution when the target's `to.columns` differ from the target's PK column order.** The hook constructs pkTuples from `rel.from.columns` paired positionally with `rel.to.columns`; the engine indexes results by the target's PK declaration order. For typical FKs that reference the parent's PK in PK order these match; for FKs that reference a unique non-PK column or that re-order the PK columns, the lookup misses. That's a Phase 3 concern when joins compile this for real; for now we accept the silent fallback to "no label".
+
+
+## 2026-06-18 — Phase 2.5 follow-up: black screen on launch (runtime value import from `@perspectives/engine`)
+
+**Bug**: after 2.5 shipped, launching `pnpm dev` opened a black, unresponsive Electron window. The renderer never rendered.
+
+**Root cause**: `TableSettingsDialog.tsx` had a runtime *value* import from `@perspectives/engine`:
+
+```ts
+import { extractTemplateColumns, type ColumnInfo, type DisplayConfig } from "@perspectives/engine";
+```
+
+Every other renderer file uses `import type` from the engine — types are erased at build time, so no engine runtime code lands in the renderer bundle. The new value import pulled the engine barrel (`@perspectives/engine/src/index.ts`) into the renderer chunk, which transitively imports `node:crypto` from `service.ts` (`randomUUID`) and `relations.ts` (`randomBytes`). Vite externalises Node built-ins for the browser; the imported references become proxies that throw on any property access. Touching them during module evaluation crashes the renderer silently before React mounts → black screen.
+
+**Fix**:
+
+- [apps/desktop/src/renderer/src/session/TableSettingsDialog.tsx](apps/desktop/src/renderer/src/session/TableSettingsDialog.tsx) — drop the runtime import; inline a small local copy of `extractTemplateColumns` (six lines + a regex; kept in sync with the engine's copy via a header comment).
+- [packages/engine/package.json](packages/engine/package.json) — added `"sideEffects": false` so Vite tree-shakes unused engine modules from the renderer chunk if a future file makes the same mistake. Tree-shaking alone would have caught most of this, but the prevention is cheap.
+
+**Acceptance verification**
+
+- `pnpm typecheck && pnpm test` workspace-wide → all 5 packages clean, **358 ✓ + 3 skipped** (DSL picked up 5 tests during the period; unrelated to this fix).
+- The renderer no longer pulls a value from `@perspectives/engine`. Confirmed by `grep -rn 'from "@perspectives/engine"' apps/desktop/src/renderer/` — every remaining hit is `import type`.
+
+**Reasoning**
+
+- **The error mode was silent because Vite externalises Node built-ins lazily**: the import doesn't crash at build time; the externalised module is a Proxy that only throws when accessed. The renderer's barrel-import-of-engine pulled `randomUUID` / `randomBytes` references in alongside the helper I actually wanted, and *something* in the bundling pipeline triggered access during module evaluation. The result is a "module loaded but won't render" failure mode that doesn't surface a stack trace in normal screens — devtools console would have shown the underlying error.
+- **The pattern to follow**: anything pure that the renderer needs from the engine lives in [packages/dsl](packages/dsl/) (which has zero Node deps) OR gets duplicated in the renderer. The engine is for the main process; the renderer talks to it through tRPC, not through direct imports.
+- **`sideEffects: false`**: the engine modules have no top-level side effects (no `console.log`, no global mutations). Marking it explicitly lets Vite drop unreferenced modules from the renderer chunk when value imports do sneak in. Safety net, not the primary fix.
+
+**Caveats**
+
+- **The renderer's copy of `extractTemplateColumns` can drift from the engine's.** A header comment tells future-me to update both. A long-term fix is to extract pure helpers like this into `@perspectives/dsl` (which IS renderer-safe), but that's a separate refactor.
+- **Other future hazards** — any renderer file that imports `formatRowLabel`, `formatRowLabelWithSecondary`, `generateRelationUlid`, `deterministicRelationId`, or any other runtime value from `@perspectives/engine` will trip the same wire. The lint rule that would prevent this (`no-restricted-imports` for the engine value imports in renderer) is a sensible TODO.
+
+
+---
+
+## 2026-06-25 — Bugfix: FK cell labels never appeared even with DisplayConfig set
+
+**Symptom**
+
+After Phase 2.5 shipped, the user configured DisplayConfig for `customers` (displayColumn = `full_name`, template = `{full_name} ({country_code})`) and opened the `orders` tab. The `customer_id` column rendered raw FK values ("1", "2", …) instead of the expected "Customer 1 (FR)" labels. A fresh `orders` tab did not help.
+
+**Probe**
+
+A live diagnostic test against the user's actual SQLite + docker-compose Postgres confirmed:
+
+- `display_configs` row IS persisted with the correct scope (`postgres://localhost:5433/perspectives_dev`) and payload.
+- `EngineService.getRowLabels`/`formatRowLabel` returns `"Customer 1 (FR)"` for `customers.id = "1"`.
+
+So the engine path was fine. The bug was in the renderer.
+
+**Root cause** — [apps/desktop/src/renderer/src/session/useFkLabels.ts](apps/desktop/src/renderer/src/session/useFkLabels.ts)
+
+A long-lived `inFlightRef: Set<string>` was deduping concurrent fetches across re-renders. Under React StrictMode (always on in `apps/desktop/src/renderer/src/main.tsx`), the dev-only mount → cleanup → remount cycle leaked:
+
+1. Mount 1 effect: `cancelled1 = false`. Adds every tuple's key to `inFlightRef`. Fires fetch.
+2. Cleanup: `cancelled1 = true`. `inFlightRef` NOT cleared.
+3. Mount 2 effect (StrictMode replay): `cancelled2 = false`. Sees every tuple in `inFlightRef`, computes `missing.length === 0` for every target, never fetches, never calls `setLabelMap`.
+4. Mount 1's fetch resolves: `cancelled1 = true` short-circuits before `setLabelMap`. Its `finally` removes the in-flight keys.
+5. End state: `labelMap` empty → `linkLabelFor` returns `null` for every FK cell → grid renders raw values.
+
+**Fix**
+
+Removed the in-flight tracker entirely. The per-effect `cancelled` closure already gives race-correctness, and the persistent `labelMap` already prevents refetches across re-renders. The tracker only saved a duplicate fetch in a very narrow case (deps change mid-flight while no labels have committed yet) — not worth the StrictMode landmine.
+
+- [apps/desktop/src/renderer/src/session/useFkLabels.ts](apps/desktop/src/renderer/src/session/useFkLabels.ts) — drop `inFlightRef` and the surrounding `inFlightKey` bookkeeping. Header note on `labelMapRef` explains why the tracker is gone, so the next person doesn't reintroduce it.
+
+**Acceptance verification**
+
+- `pnpm -w turbo run typecheck` → 5/5 clean.
+- Renderer behaviour to verify by hand: open `orders` tab → FK cells in `customer_id` column show "Customer N (XX)" labels instead of raw IDs.
+
+**Caveats / follow-ups**
+
+- Cache invalidation still imperfect: `useFkLabels` doesn't watch the DisplayConfig query, so editing a target table's config while a source-table tab is mounted won't refresh that tab's already-cached labels. Today the user is forced to switch tabs (which remounts `TableView` via its `key={kind:schema.table}`). If we want live propagation, the right move is to migrate the hook to TanStack Query and invalidate `data.getRowLabels` on `displayConfig.upsert`. Deferred.
+- A renderer test that mounts the hook under StrictMode and asserts labels reach the grid would have caught this. Worth adding when we revisit grid testing.
+
+---
+
+## 2026-06-29 — Bugfix: custom non-PK relation poisoned FK label batch
+
+**Symptom**
+
+After the StrictMode fix landed, FK labels still didn't show on the `orders` tab. Renderer console revealed the real reason:
+
+```
+[fk-labels] → getRowLabels { target: 'public.customers', missing: 104, sample: [...] }
+[fk-labels] getRowLabels FAILED { cause: TRPCClientError: invalid input syntax for type bigint: "shipped" }
+```
+
+**Root cause** — [apps/desktop/src/renderer/src/session/useFkLabels.ts](apps/desktop/src/renderer/src/session/useFkLabels.ts), [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx)
+
+Phase 2.4 lets users define custom relations that reference unique non-PK columns (the canonical example: `orders.status → customers.email`). The hook iterated every column-with-link and unconditionally fed the source column's values into a PK-keyed lookup against the target table. For `orders.status`, it pushed `"shipped"`, `"pending"`, etc. into the `public.customers` pkTuple batch. Postgres rejected the cast (`bigint` PK can't accept `"shipped"`), the entire batch failed, and even the legitimate `orders.customer_id → customers.id` relation got no labels back.
+
+**Fix**
+
+Annotate every `ForwardLink` with `targetIsPk: boolean` — true iff `relation.to.columns` matches the target table's `primaryKey` exactly (same length, same order). The label hook skips any link with `targetIsPk === false`. Click-to-follow / arrow rendering are unchanged — those work for any relation.
+
+- [apps/desktop/src/renderer/src/grid/types.ts](apps/desktop/src/renderer/src/grid/types.ts) — added `targetIsPk` to `ForwardLink`.
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx) — added `tablesByKey` map of `${schema}.${table} → { primaryKey }` built from the snapshot; `gridColumns` now computes `targetIsPk` per link by comparing `relation.to.columns` against the target's PK.
+- [apps/desktop/src/renderer/src/session/useFkLabels.ts](apps/desktop/src/renderer/src/session/useFkLabels.ts) — `required` memo skips links with `targetIsPk === false`. Also dropped the StrictMode-bug-finding diagnostic logs from the previous step.
+
+**Acceptance verification**
+
+- `pnpm -w turbo run typecheck` → all 5 packages clean.
+- `apps/desktop/src/renderer/src/session/links.test.ts` — 13/13 passing (links module untouched; `buildColumnLinkMap` still returns `Map<string, RelationDef>`).
+- Manual: open `orders` tab — `customer_id` cells render "Customer N (XX)" while `status` cells keep their click-to-follow arrow but show the raw enum value.
+
+**Caveats / follow-ups**
+
+- The hook still assumes that when `targetIsPk === true`, the FK columns line up positionally with the target's PK columns. That holds for every schema-derived FK we generate. A maliciously hand-edited custom relation that points at the PK but in a different column order would mis-key the lookup — but the worst case is wrong labels, not a SQL crash.
+- The engine's `getRowLabels` should also defensively reject non-PK-shaped lookups instead of trusting the renderer. Filed mentally as a hardening pass for Phase 4.
+- Long-term, supporting label lookups for unique non-PK columns is reasonable — would require `getRowLabels` to accept a `lookupColumns` parameter and key results by that instead of PK. Not worth the API churn for Phase 2.
+
+---
+
+## 2026-07-01 — Phase 2.6: Cardinality preview badges
+
+**Goal**
+
+Surface an inline count for 1-2 outbound relations on each visible row, so opening `customers` shows "3 orders" per row without a click. Estimated when the target is huge, exact when it isn't; user can click a `~` badge to escalate to exact.
+
+**DSL** — [packages/dsl/src/schemas.ts](packages/dsl/src/schemas.ts)
+
+Extended `DisplayConfig`:
+
+- `displayColumn` moved to optional so a config can be cardinality-only.
+- New `cardinalityRelations?: string[]` (0-2 relation IDs). Absent/empty means preview is off.
+
+**Engine** — [packages/engine/src/service.ts](packages/engine/src/service.ts), [packages/engine/src/adapter.ts](packages/engine/src/adapter.ts), [packages/adapter-postgres/src/adapter.ts](packages/adapter-postgres/src/adapter.ts)
+
+New method:
+
+```
+engine.getCountsForRows(connectionId, schema, table, pkTuples, relationIds, { forceExact? })
+  → Array<{ pkTuple, relationId, count, estimated }>
+```
+
+Per relation:
+
+- Resolve target + group columns for 1:n (source = parent side) and m:n (either side via junction). Anything else is silently skipped, including the earlier "custom relation → unique non-PK column" case that bit us in 2.5.
+- Above `REFERENCING_COUNT_THRESHOLD` (100k) on the target: per-row `estimateCount` (one EXPLAIN per tuple, tagged `estimated: true`).
+- Below: one grouped `countByGroup(schema, table, groupColumns, inTuples)` round trip. The adapter method composes `SELECT groupColumns, COUNT(*) FROM t WHERE (groupColumns) IN (inTuples) GROUP BY groupColumns` and returns `{key, count}[]`; the engine maps keys back to input pkTuples so missing rows get an explicit `{count: 0}` entry instead of being dropped.
+- `forceExact: true` bypasses the threshold — used by the "click to escalate" affordance on estimate badges.
+
+`countByGroup` is on the `DatabaseAdapter` interface so raw SQL stays inside adapter-postgres. Uses the existing `quoteIdentifier` helper and Postgres row-value `IN` syntax; single-column and compound PKs share the same code path (Postgres treats `(col) IN ((v1),(v2))` as `col IN (v1,v2)`).
+
+Batch caps: `MAX_COUNT_BATCH = 200` rows, `MAX_PREVIEW_RELATIONS = 2`.
+
+**tRPC**
+
+- [apps/desktop/src/main/trpc/inputs.ts](apps/desktop/src/main/trpc/inputs.ts) — `getCountsForRowsInputSchema` (rows ≤ 200, relations ≤ 2, optional `forceExact`), and extended `displayConfigPayloadSchema` (`displayColumn` optional, added `cardinalityRelations`).
+- [apps/desktop/src/main/trpc/routers/data.ts](apps/desktop/src/main/trpc/routers/data.ts) — `data.getCountsForRows` procedure.
+
+**Renderer**
+
+- [apps/desktop/src/renderer/src/session/cardinality-cache.ts](apps/desktop/src/renderer/src/session/cardinality-cache.ts) — pure cache primitives (`tupleKey`, `distinctPkTuples`, `missingForRelation`, `mergeResults`). Kept separate from the hook so scroll / cache-hit semantics are unit-testable without React + tRPC.
+- [apps/desktop/src/renderer/src/session/useRowCardinalities.ts](apps/desktop/src/renderer/src/session/useRowCardinalities.ts) — hook. Local `Map<relationId, Map<tupleKey, {count, estimated}>>` state. Effect fires one round-trip per relation for missing tuples on `(pkTuples, relationIds, source)` change. `countsFor(row)` returns `null` while loading. `escalate(row, relId)` calls the endpoint with `forceExact: true`.
+
+  Same StrictMode caveat as `useFkLabels` — no in-flight tracker; `cancelled` closure + persistent cache handle correctness.
+
+- [apps/desktop/src/renderer/src/session/TableSettingsDialog.tsx](apps/desktop/src/renderer/src/session/TableSettingsDialog.tsx) — new "Preview cardinality" section. Lists outbound relations eligible for preview (1:n with source on parent side and `to.columns === source PK`, or m:n where the source side's columns match the PK). Native checkboxes with a hard cap of 2 selections. `displayColumn` no longer required to save — every field is independently optional now.
+
+  New required props: `primaryKey`, `relations`. TableView threads them from the schema snapshot + relations query.
+
+- [apps/desktop/src/renderer/src/grid/types.ts](apps/desktop/src/renderer/src/grid/types.ts) + [apps/desktop/src/renderer/src/grid/DataGrid.tsx](apps/desktop/src/renderer/src/grid/DataGrid.tsx) — added three optional props: `badgeAreaWidth`, `badgeHeader`, `renderRowBadges`. When width > 0, header + rows + skeleton reserve a fixed slot between the gutter and the first data column. Rendering is a `ReactNode` from the caller — the grid stays presentational; the renderer does formatting, tooltip text, and click wiring.
+
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx) — reads `DisplayConfig.cardinalityRelations`, runs `useRowCardinalities`, and renders one small pill per relation per row. `~` prefix + amber styling when estimated; clicking an estimated badge invokes `escalate`.
+
+**Tests**
+
+- [apps/desktop/src/renderer/src/session/cardinality-cache.test.ts](apps/desktop/src/renderer/src/session/cardinality-cache.test.ts) — 14 cases covering int8/number tuple-key normalisation, deduping, `missingForRelation` cache-hit / cache-miss behaviour, `mergeResults` scoping + immutability, and a full scroll-flow simulation (page 1 → page 2 dedupes cached entries).
+- [apps/desktop/test/integration.test.ts](apps/desktop/test/integration.test.ts) — full-stack tRPC test against docker-compose Postgres:
+  - First 100 customers × orders relation → every entry `count: 3, estimated: false`.
+  - Sweep all 3000 customers in 200-row batches → sum equals 9000 (matches the seed's `9000 orders / 3000 customers via i % 3000`).
+  - Missing PKs return `count: 0` (not omitted).
+  - Unknown relation IDs are silently skipped rather than throwing.
+
+`pnpm -w turbo run typecheck test` → all 5 packages green.
+
+**Caveats / follow-ups**
+
+- The hook fetches for ALL currently-loaded rows, not just the virtualizer's visible range. Simplest thing that works; the page size cap (typically 50-100) is well under the 200-row batch limit. If a future page size makes this expensive we can subscribe to the virtualizer's visible range and dispatch on `onRangeChanged`.
+- The gutter itself isn't widened — we introduced a dedicated column slot between the gutter and the data columns. Reads better than cramming a badge into `[#|kebab]` for compound PKs.
+- Live cache invalidation: same story as FK labels — a config change on a currently-mounted `TableView` doesn't repopulate until tab-switch (which remounts). See the 2026-06-25 follow-up.
+- The engine trusts the renderer's `forceExact` flag today. If we ever expose it to plugins or external callers, cap the total row-count that a `forceExact: true` invocation can touch (a malicious call could hammer the DB with `countByGroup` against a 100M-row table).
+
+---
+
+## 2026-07-06 — Phase 2.7: Breadcrumb completion (persistence, overflow, back-step)
+
+**Scope**
+
+The Phase 2.2 breadcrumb foundation already carried a `crumbs: BreadcrumbStep[]` through every filteredTable open. This phase adds the missing polish:
+
+- **Persistence** was already round-tripped by [apps/desktop/src/renderer/src/session/tabs-storage.ts](apps/desktop/src/renderer/src/session/tabs-storage.ts) (schema reuses `dslSchemas.FilterGroup` for both the tab filter and every step filter, 1-16 hops). Added a 4-hop round-trip test + a compound-PK 3-hop test to the test file to lock the invariant.
+- **Overflow collapse** at 5+ hops: head crumb, "…" dropdown of hidden crumbs, last two crumbs.
+- **Back-step** via a leading arrow button + Cmd/Ctrl+[ keyboard shortcut. Both re-open the second-to-last crumb.
+- **Reactive labels** driven by `data.getRowLabels` — a DisplayConfig change on any crumb's target table updates the visible label on the next mount.
+- **Self-referential honesty** — no dedup for manager→manager→manager chains. The overflow dropdown is what keeps them usable, not fake collapsing.
+
+**Files**
+
+- [apps/desktop/src/renderer/src/session/crumbs.ts](apps/desktop/src/renderer/src/session/crumbs.ts) — pure helpers:
+  - `collapseCrumbs` returns `{ collapsed, head, hidden, tail }`. Threshold is `CRUMB_COLLAPSE_THRESHOLD = 5`; below that the trail renders inline (all hops in `tail`, `hidden` empty, `collapsed = false`). At/above, `hidden` covers indices `1..length-3` and `tail` covers the last two.
+  - `crumbTargetPk` extracts the target-side PK tuple from a crumb whose filter is a flat AND-of-eq that fully covers the target's PK. Returns `null` on any deviation (nested groups, non-eq ops, array values, missing columns) so the caller falls back to the persisted label.
+
+- [apps/desktop/src/renderer/src/session/useCrumbLabels.ts](apps/desktop/src/renderer/src/session/useCrumbLabels.ts) — hook: extract every crumb's `(schema, table, PK tuple)`, group by target, run one `data.getRowLabels` per distinct target with all deduped tuples, cache results by `${schema}.${table}` → tupleKey → label. Returns `Map<crumbIndex, string>` — only the crumbs whose labels came back with content are present; the caller falls back to the persisted `crumb.label` for the rest.
+
+- [apps/desktop/src/renderer/src/session/TableView.tsx](apps/desktop/src/renderer/src/session/TableView.tsx):
+  - Split the old BreadcrumbBar into a presentational `BreadcrumbBar` (exports; takes `resolvedLabels: Map<number, string>` as a prop) and a tRPC-connected `BreadcrumbBarWithLabels` wrapper. This lets the DOM test mount the bar without a query client or IPC bridge.
+  - New back-arrow button on the leading edge. Disabled on single-hop trails; opens `crumbs.length - 2` otherwise.
+  - Cmd/Ctrl+[ shortcut in a document-scoped `useEffect`, gated so focused inputs/textareas/contenteditable elements keep their own handling. Only mounted while this TableView is visible (SessionView unmounts inactive tabs via its keyed conditional render).
+  - `CrumbOverflowMenu` — new local component; kebab-style dropdown listing every hidden crumb (schema, table, resolved label) — click to open.
+  - Head + last two now share a common renderer; every crumb goes through `resolvedLabels.get(index) ?? step.label`.
+
+**Tests**
+
+- [apps/desktop/src/renderer/src/session/crumbs.test.ts](apps/desktop/src/renderer/src/session/crumbs.test.ts) — 13 cases: empty / 1-hop / 4-hop-inline / 5-hop-collapses / 6-hop-collapses; self-referential 5-hop chain doesn't dedup; `crumbTargetPk` for single + compound + reordered + missing-column + OR-group + non-eq + non-primitive + no-PK.
+- [apps/desktop/src/renderer/src/session/tabs-storage.test.ts](apps/desktop/src/renderer/src/session/tabs-storage.test.ts) — added a 4-hop round-trip case + a compound-PK 3-hop case.
+- [apps/desktop/src/renderer/src/session/BreadcrumbBar.test.tsx](apps/desktop/src/renderer/src/session/BreadcrumbBar.test.tsx) — 5 DOM cases via jsdom + `@testing-library/react`: 4 hops inline, 5 hops collapse (head + `2 hidden` overflow + last two), overflow-open reveals hidden crumbs, `resolvedLabels` override wins over persisted, back arrow opens `crumbs[length-2]`, back arrow disabled on 1-hop.
+
+`pnpm -w turbo run typecheck test` → all 10 tasks green (5 packages × typecheck + test).
+
+**Caveats / follow-ups**
+
+- `useCrumbLabels`' cache is session-scoped and doesn't invalidate on DisplayConfig save. Same trade-off as `useFkLabels` and `useRowCardinalities`: switching tabs remounts the TableView and refreshes the cache. If we ever want live propagation, all three hooks migrate to TanStack Query at once.
+- The Cmd/Ctrl+[ handler is scoped to `document.keydown`. It doesn't fire while a shadcn `Dialog` is open (Radix traps focus) — good — but it also doesn't fire while a native modal is open. If we later add native prompts we may need to tighten the guard.
+- The dropdown menu is a plain absolute-positioned div; it doesn't reposition on scroll. Long trails on narrow windows may hit the right edge. Not urgent — the whole nav is `overflow-x-auto` so the user can always scroll.
+
+---
+
+## 2026-07-06 — Fix: window not draggable on macOS
+
+**Scope**
+
+User reported the Electron window couldn't be moved on the desktop. Root cause: [apps/desktop/src/main/index.ts:30](apps/desktop/src/main/index.ts#L30) sets `titleBarStyle: "hiddenInset"` on macOS, which removes the native title bar (keeping only inset traffic lights) and requires the renderer to explicitly mark draggable regions via `-webkit-app-region: drag` CSS — Chromium does not do this automatically. A repo-wide search confirmed no `-webkit-app-region` declaration existed anywhere in the renderer, so none of the window was draggable.
+
+**Files**
+
+- [apps/desktop/src/renderer/src/session/SessionView.tsx](apps/desktop/src/renderer/src/session/SessionView.tsx) — the top `<header>` (back button, connection name, Relations/New SQL actions) is now a drag region (`[-webkit-app-region:drag]`); the three `<Button>`s inside are marked `[-webkit-app-region:no-drag]` so clicks still register.
+- [apps/desktop/src/renderer/src/App.tsx](apps/desktop/src/renderer/src/App.tsx) — the pre-session connections screen had no top bar at all, so a thin (`h-6`) full-width drag strip was added at the top, rendered only when `active === null` (so it doesn't overlay `SessionView`'s own header once a connection is open). The floating theme-toggle button (always rendered, `position: absolute`, sits on top of whichever screen is showing) is marked `no-drag`.
+- Used Tailwind's arbitrary-property syntax (`[-webkit-app-region:drag]` / `[...:no-drag]`) rather than inline `style` objects, since `-webkit-app-region` isn't part of the `csstype`/`React.CSSProperties` typings this repo's `tsc` checks against, and the project's "no `any`, no unsafe casts" rule rules out forcing it through `style`.
+
+**Verification**
+
+- `pnpm run typecheck` and `pnpm exec eslint` (scoped to the two changed files) both pass.
+- Could not verify the actual drag interaction: dragging a native OS window is a physical mouse-interaction outcome, not something visible in a screenshot, and this sandbox can't drive real OS-level mouse drag events. Attempted to launch the dev app for a sanity screenshot; the background Electron process died along with the wrapping shell before it reached a window (no window nor stray process was left running). Recommend the user run `pnpm dev` (or their normal flow) themselves and confirm the window drags from the top header / connections-screen strip.
+
+**Caveats / follow-ups**
+
+- The `h-6` (24px) drag strip on the connections screen was sized to sit above `ConnectionList`'s `p-6` header row without overlapping it — not derived from the actual macOS traffic-light geometry, so it's a reasonable-looking guess rather than a pixel-measured fit.
+- Windows/Linux use `titleBarStyle: "default"` (native frame), so this was a macOS-only bug; the CSS fix is harmless but a no-op there since the frame already provides dragging.

@@ -353,6 +353,30 @@ export interface FilterOpCapability {
 }
 
 // ============================================================================
+// countByGroup
+// ============================================================================
+
+/** Primitive value usable as a SQL filter literal — same shape the engine
+ *  uses for PK tuples elsewhere. */
+export type CountByGroupValue = string | number | boolean | null;
+
+export interface CountByGroupArgs {
+  schema: string;
+  table: string;
+  /** Columns that are BOTH the filter columns and the GROUP BY columns. */
+  groupColumns: readonly string[];
+  /** Each tuple's values align positionally with `groupColumns`. The adapter
+   *  emits `WHERE (groupColumns) IN (inTuples)`. */
+  inTuples: ReadonlyArray<ReadonlyArray<CountByGroupValue>>;
+}
+
+export interface CountByGroupResult {
+  /** Aligned with `groupColumns` — the values that came back from the row. */
+  key: ReadonlyArray<CountByGroupValue>;
+  count: number;
+}
+
+// ============================================================================
 // The interface itself.
 // ============================================================================
 
@@ -394,6 +418,23 @@ export interface DatabaseAdapter {
   /** Cheap, possibly-stale row count (e.g. `pg_class.reltuples`). Surfaced with
    *  a "~" prefix in the UI. */
   estimateCount(plan: QueryPlan): Promise<number>;
+
+  /**
+   * Aggregate exact row counts grouped by a set of columns. Used by
+   * cardinality preview to compute "47 orders, 3 tags" per visible row in
+   * one round-trip per relation (vs N round-trips, one per row). Composes:
+   *
+   *   SELECT groupColumns, COUNT(*)
+   *   FROM schema.table
+   *   WHERE (groupColumns) IN (inTuples)
+   *   GROUP BY groupColumns
+   *
+   * The caller is responsible for the estimate-vs-exact decision; this
+   * method always returns exact counts and is unsuitable for huge target
+   * tables. Returns one entry per group key that actually appeared; the
+   * caller fills in zeros for keys with no matches.
+   */
+  countByGroup(args: CountByGroupArgs): Promise<CountByGroupResult[]>;
 
   /** Pull one page of rows via keyset pagination. The first call passes no
    *  cursor; each subsequent call passes the cursor from the previous result. */

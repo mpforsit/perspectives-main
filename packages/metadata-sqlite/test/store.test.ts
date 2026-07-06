@@ -234,10 +234,31 @@ describe("SqliteMetadataStore — DSL validation", () => {
     await expect(store.perspectives.get(p.id)).rejects.toBeInstanceOf(ValidationError);
   });
 
-  it("round-trips a RelationDef", async () => {
+  it("round-trips a RelationDef under a scope", async () => {
     const r = makeRelation();
-    await store.relations.create(r);
+    const scope = "postgres://localhost:5432/perspectives_dev";
+    await store.relations.create(scope, r);
     const back = await store.relations.get(r.id);
     expect(back).toEqual(r);
+  });
+
+  it("listForScope returns only relations under the queried scope", async () => {
+    const scopeA = "postgres://localhost:5432/db_a";
+    const scopeB = "postgres://localhost:5432/db_b";
+    const r1 = makeRelation({ id: "01J9X2KZQ5N7P3VCM8B4ETRGYJ" });
+    const r2 = makeRelation({ id: "01J9X2KZQ5N7P3VCM8B4ETRGYK" });
+    const r3 = makeRelation({ id: "01J9X2KZQ5N7P3VCM8B4ETRGYM" });
+    await store.relations.create(scopeA, r1);
+    await store.relations.create(scopeA, r2);
+    await store.relations.create(scopeB, r3);
+
+    const aRelations = await store.relations.listForScope(scopeA);
+    expect(aRelations.map((r) => r.id).sort()).toEqual([r1.id, r2.id].sort());
+    const bRelations = await store.relations.listForScope(scopeB);
+    expect(bRelations.map((r) => r.id)).toEqual([r3.id]);
+    const cRelations = await store.relations.listForScope(
+      "postgres://nope:5432/missing",
+    );
+    expect(cRelations).toEqual([]);
   });
 });

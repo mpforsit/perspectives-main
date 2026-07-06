@@ -92,6 +92,54 @@ export interface AppendStore<T> {
   list(query?: AppendListQuery): Promise<T[]>;
 }
 
+/**
+ * Scoped store for `DisplayConfig` rows. One config per
+ * `(scope, schema, table)`; upsert handles "save or overwrite" so the
+ * caller doesn't need to branch on create-vs-update.
+ *
+ * Scope is the engine's `relationScopeKey(profile)` — same key the custom
+ * relations store uses. Two database profiles pointing at the same DB
+ * share configs.
+ */
+export interface DisplayConfigRepository {
+  getForTable(
+    scope: string,
+    schema: string,
+    table: string,
+  ): Promise<DisplayConfig | null>;
+  /** All display configs persisted under `scope`. */
+  listForScope(scope: string): Promise<DisplayConfig[]>;
+  /** Insert or replace by (scope, schema, table). */
+  upsert(scope: string, value: DisplayConfig): Promise<DisplayConfig>;
+  /** Idempotent delete. */
+  delete(scope: string, schema: string, table: string): Promise<void>;
+}
+
+/**
+ * Scoped store for custom `RelationDef`s.
+ *
+ * Relations exist per *database*, not per `ConnectionProfile`. Two profiles
+ * pointing at the same Postgres see the same custom relations; renaming a
+ * profile doesn't orphan them. The scope is the engine's
+ * `relationScopeKey(profile)` — typically `"<dialect>://<host>:<port>/<db>"`
+ * — and is opaque to the store.
+ *
+ * `id` remains the RelationDef's own ULID (globally unique within the
+ * store); the scope is an orthogonal index. Update + delete operate by id
+ * alone since the id is already unique; create requires a scope.
+ */
+export interface RelationsRepository {
+  get(id: string): Promise<RelationDef | null>;
+  /** All custom relations stored under `scope`. */
+  listForScope(scope: string): Promise<RelationDef[]>;
+  /** Persist a new custom RelationDef in `scope`. */
+  create(scope: string, value: RelationDef): Promise<RelationDef>;
+  /** Replace an existing RelationDef. The scope is fixed at creation time. */
+  update(id: string, value: RelationDef): Promise<RelationDef>;
+  /** Idempotent delete by id. */
+  delete(id: string): Promise<void>;
+}
+
 export interface AppendListQuery extends ListQuery {
   /** ISO-8601 lower bound (inclusive) on `timestamp`. */
   since?: string;
@@ -217,8 +265,8 @@ export interface Share {
  */
 export interface MetadataStore {
   perspectives: CRUDStore<PerspectiveDef>;
-  relations: CRUDStore<RelationDef>;
-  displayConfig: CRUDStore<DisplayConfig>;
+  relations: RelationsRepository;
+  displayConfig: DisplayConfigRepository;
   connections: CRUDStore<ConnectionProfile>;
   auditLog: AppendStore<AuditEvent>;
   settings: KVStore;

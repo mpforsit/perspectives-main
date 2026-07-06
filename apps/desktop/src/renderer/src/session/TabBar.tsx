@@ -1,4 +1,4 @@
-import { Eye, FileCode2, Table as TableIcon, X } from "lucide-react";
+import { Eye, FileCode2, Filter, Table as TableIcon, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -7,6 +7,7 @@ import { tabKey, type OpenTab } from "./types";
 function tabIcon(tab: OpenTab) {
   if (tab.kind === "table") return TableIcon;
   if (tab.kind === "view") return Eye;
+  if (tab.kind === "filteredTable") return Filter;
   return FileCode2;
 }
 

@@ -10,9 +10,13 @@
  */
 
 import init0001 from "./migrations/0001_initial.sql?raw";
+import scope0002 from "./migrations/0002_relations_scope.sql?raw";
+import display0003 from "./migrations/0003_display_configs_scope.sql?raw";
 
 import type { Migration } from "./migrations";
 
 export const BUNDLED_MIGRATIONS: Migration[] = [
   { filename: "0001_initial.sql", sql: init0001 },
+  { filename: "0002_relations_scope.sql", sql: scope0002 },
+  { filename: "0003_display_configs_scope.sql", sql: display0003 },
 ];
